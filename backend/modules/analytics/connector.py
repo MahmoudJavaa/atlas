@@ -26,7 +26,7 @@ class AnalyticsConnector:
         if not site:
             return {"error": "Site not found"}
 
-        end_date = datetime.utcnow().date()
+        end_date = datetime.now(tz=None).date()
         start_date = end_date - timedelta(days=days)
 
         try:
@@ -127,7 +127,7 @@ class AnalyticsConnector:
         from backend.models.keyword import Keyword
         from datetime import date
 
-        cutoff = datetime.utcnow().date() - timedelta(days=days)
+        cutoff = datetime.now(tz=None).date() - timedelta(days=days)
         result = await self.db.execute(
             select(
                 func.sum(Keyword.clicks).label("total_clicks"),

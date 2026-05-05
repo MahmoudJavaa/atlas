@@ -1,4 +1,20 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./ollama:/ollama-scripts
+    ports:
+      - "11434:11434"
+    entrypoint: ["/bin/bash", "/ollama-scripts/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "/bin/ollama list 2>/dev/null | grep -q 'llama3.2' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 60        # up to 15 min for first-run model download
+      start_period: 20s
+    restart: unless-stopped
+
   api:
     build:
       context: ./backend
@@ -9,13 +25,14 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://atlas:atlas@db:5432/atlas
       - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_URL=http://ollama:11434
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
-      - ./backend:/app
+      - ./backend:/app/backend
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 
   worker:
@@ -26,13 +43,14 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://atlas:atlas@db:5432/atlas
       - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_URL=http://ollama:11434
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
-      - ./backend:/app
+      - ./backend:/app/backend
     command: celery -A backend.celery_app worker --loglevel=info -Q crawl,keyword,content,analytics,learning
 
   beat:
@@ -49,7 +67,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend:/app
+      - ./backend:/app/backend
     command: celery -A backend.celery_app beat --loglevel=info
 
   db:
@@ -85,9 +103,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=http://api:8000
     depends_on:
       - api
 
 volumes:
   postgres_data:
+  ollama_data:

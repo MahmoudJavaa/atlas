@@ -41,7 +41,7 @@ async def crawl_sync(data: CrawlRequest, db: AsyncSession = Depends(get_db)):
 async def get_crawl_results(
     site_id: int,
     severity: Optional[str] = None,
-    limit: int = 100,
+    limit: int = 1000,
     db: AsyncSession = Depends(get_db),
 ):
     """Get crawl results, optionally filtered by severity."""
@@ -73,14 +73,39 @@ async def get_crawl_results(
 async def get_audit_summary(site_id: int, db: AsyncSession = Depends(get_db)):
     """Get issue summary counts for a site."""
     from sqlalchemy import func
-    result = await db.execute(
+
+    # Total pages + avg severity
+    agg_result = await db.execute(
         select(
             func.count(CrawlResult.id).label("total_pages"),
             func.avg(CrawlResult.severity_score).label("avg_severity"),
         ).where(CrawlResult.site_id == site_id)
     )
-    row = result.one()
+    row = agg_result.one()
+
+    # Per-page issue counts
+    pages_result = await db.execute(
+        select(CrawlResult.issues).where(CrawlResult.site_id == site_id)
+    )
+    all_issues = pages_result.scalars().all()
+
+    critical_count = 0
+    warning_count = 0
+    info_count = 0
+    for issues in all_issues:
+        if not isinstance(issues, dict):
+            continue
+        if issues.get("critical"):
+            critical_count += 1
+        if issues.get("warning"):
+            warning_count += 1
+        if issues.get("info"):
+            info_count += 1
+
     return {
         "total_pages": int(row.total_pages or 0),
         "avg_severity_score": round(float(row.avg_severity or 0), 1),
+        "critical_count": critical_count,
+        "warning_count": warning_count,
+        "info_count": info_count,
     }

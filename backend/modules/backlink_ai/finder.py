@@ -5,8 +5,8 @@ import json
 import re
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import anthropic
 import httpx
+from backend.llm import get_llm
 from backend.config import settings
 from backend.models.backlink import BacklinkOpportunity
 
@@ -44,7 +44,7 @@ Return JSON: {{"score": <float 0-1>, "reasoning": "...", "outreach_difficulty": 
 class BacklinkFinder:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.llm = get_llm()
 
     async def run(self, site_id: int, target_domain: str, topic: str) -> dict:
         """Find backlink opportunities and generate outreach emails."""
@@ -61,7 +61,6 @@ class BacklinkFinder:
     async def _find_opportunities(self, target_domain: str, topic: str) -> list[dict]:
         """Use SerpAPI to find competitor backlinks and resource pages."""
         if not settings.serpapi_key:
-            # Return mock opportunities for testing
             return [
                 {
                     "url": f"https://example.com/{topic.replace(' ', '-')}-resources",
@@ -110,13 +109,7 @@ class BacklinkFinder:
                 snippet=opp.get("snippet", ""),
             )
             try:
-                message = self.client.messages.create(
-                    model=settings.claude_model,
-                    max_tokens=256,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                raw = message.content[0].text.strip()
-                score_data = json.loads(raw)
+                score_data = self.llm.generate_json(prompt, max_tokens=256)
                 opp["score"] = score_data.get("score", 0.5)
                 opp["outreach_difficulty"] = score_data.get("outreach_difficulty", "medium")
                 opp["score_reasoning"] = score_data.get("reasoning", "")
@@ -128,7 +121,7 @@ class BacklinkFinder:
         return sorted(scored, key=lambda x: x["score"], reverse=True)
 
     async def _generate_outreach(self, opportunities: list[dict], target_domain: str, topic: str) -> list[dict]:
-        for opp in opportunities[:10]:  # Only generate for top 10
+        for opp in opportunities[:10]:
             prompt = OUTREACH_PROMPT.format(
                 source_domain=opp.get("source_domain", ""),
                 source_url=opp["url"],
@@ -137,15 +130,7 @@ class BacklinkFinder:
                 reason=f"We have comprehensive content on {topic} that would add value to your readers.",
             )
             try:
-                message = self.client.messages.create(
-                    model=settings.claude_model,
-                    max_tokens=512,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                raw = message.content[0].text.strip()
-                raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw)
-                email_data = json.loads(raw)
+                email_data = self.llm.generate_json(prompt, max_tokens=512)
                 opp["outreach_email"] = email_data
             except Exception:
                 opp["outreach_email"] = {"subject": "Link opportunity", "body": ""}

@@ -1,4 +1,4 @@
-"""Tests for KeywordClassifier — mocked Claude + SerpAPI."""
+"""Tests for KeywordClassifier — mocked LLM + SerpAPI."""
 import pytest
 import json
 from unittest.mock import AsyncMock, MagicMock
@@ -11,12 +11,10 @@ MOCK_CLASSIFICATION = [
 ]
 
 
-def make_mock_claude():
-    mock_msg = MagicMock()
-    mock_msg.content = [MagicMock(text=json.dumps(MOCK_CLASSIFICATION))]
-    client = MagicMock()
-    client.messages.create.return_value = mock_msg
-    return client
+def make_mock_llm():
+    llm = MagicMock()
+    llm.generate_json.return_value = MOCK_CLASSIFICATION
+    return llm
 
 
 @pytest.mark.asyncio
@@ -29,10 +27,7 @@ async def test_classify_intent_returns_structured_data():
     db.flush = AsyncMock()
 
     classifier = KeywordClassifier(db=db)
-    classifier.client = make_mock_claude()
-
-    # Bypass SerpAPI
-    classifier.serpapi_key = ""
+    classifier.llm = make_mock_llm()
 
     result = await classifier._classify_intent(
         [{"keyword": kw, "volume": None, "serp_features": []} for kw in

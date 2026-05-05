@@ -86,7 +86,7 @@ class CMSPublisher:
             page.cms_post_id = cms_post_id
             page.status = "published"
             from datetime import datetime
-            page.published_at = datetime.utcnow()
+            page.published_at = datetime.now(tz=None)
             await self.db.flush()
             return {"success": True, "wp_post_id": cms_post_id, "url": data.get("link")}
         else:
@@ -120,7 +120,7 @@ class CMSPublisher:
             page.cms_post_id = data.get("id")
             page.status = "published"
             from datetime import datetime
-            page.published_at = datetime.utcnow()
+            page.published_at = datetime.now(tz=None)
             await self.db.flush()
             return {"success": True, "shopify_page_id": data.get("id"), "handle": data.get("handle")}
         else:

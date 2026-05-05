@@ -1,4 +1,4 @@
-"""Tests for LocalSEOPageGenerator — uses mock Claude responses."""
+"""Tests for LocalSEOPageGenerator — uses mock LLM responses."""
 import pytest
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,12 +19,10 @@ MOCK_PAGE_RESPONSE = {
 }
 
 
-def make_mock_claude(response_dict):
-    mock_message = MagicMock()
-    mock_message.content = [MagicMock(text=json.dumps(response_dict))]
-    mock_client = MagicMock()
-    mock_client.messages.create.return_value = mock_message
-    return mock_client
+def make_mock_llm(response_dict):
+    llm = MagicMock()
+    llm.generate_json.return_value = response_dict
+    return llm
 
 
 @pytest.mark.asyncio
@@ -37,7 +35,7 @@ async def test_generate_page_passes_doorway_check():
     db.refresh = AsyncMock()
 
     generator = LocalSEOPageGenerator(db=db)
-    generator.client = make_mock_claude(MOCK_PAGE_RESPONSE)
+    generator.llm = make_mock_llm(MOCK_PAGE_RESPONSE)
 
     result = await generator.run(
         service="Emergency Locksmith",
@@ -62,18 +60,16 @@ async def test_generate_page_blocked_on_low_doorway_score():
     generator = LocalSEOPageGenerator(db=db)
 
     call_count = 0
-    def mock_create(**kwargs):
+    def mock_generate_json(prompt, **kwargs):
         nonlocal call_count
         call_count += 1
-        mock_msg = MagicMock()
         if call_count == 1:
-            mock_msg.content = [MagicMock(text=json.dumps(low_score_response))]
+            return low_score_response
         else:
-            mock_msg.content = [MagicMock(text=json.dumps(doorway_check_response))]
-        return mock_msg
+            return doorway_check_response
 
-    generator.client = MagicMock()
-    generator.client.messages.create.side_effect = mock_create
+    generator.llm = MagicMock()
+    generator.llm.generate_json.side_effect = mock_generate_json
 
     result = await generator.run(
         service="Plumber",

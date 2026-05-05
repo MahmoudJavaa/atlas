@@ -1,4 +1,4 @@
-"""Keyword Intelligence — intent classification + cluster mapping via Claude + SerpAPI."""
+"""Keyword Intelligence — intent classification + cluster mapping via Gemini + SerpAPI."""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-import anthropic
+from backend.llm import get_llm
 from backend.config import settings
 from backend.models.keyword import Keyword
 
@@ -29,14 +29,14 @@ Keywords:
 class KeywordClassifier:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.llm = get_llm()
 
     async def run(self, site_id: int, seed_keywords: list[str]) -> dict[str, Any]:
         """Classify keywords and store in DB. Returns structured keyword map."""
         # Enrich via SerpAPI if key available
         enriched = await self._enrich_via_serp(seed_keywords)
 
-        # Classify intent via Claude
+        # Classify intent via LLM
         classified = await self._classify_intent(enriched)
 
         # Detect cannibalization
@@ -83,20 +83,16 @@ class KeywordClassifier:
         return enriched
 
     async def _classify_intent(self, enriched: list[dict]) -> list[dict]:
-        """Use Claude to classify intent for all keywords."""
+        """Use LLM to classify intent for all keywords."""
+        from backend.llm import ollama_is_available
         keyword_list = [item["keyword"] for item in enriched]
         prompt = INTENT_PROMPT.format(keywords="\n".join(f"- {kw}" for kw in keyword_list))
 
-        message = self.client.messages.create(
-            model=settings.claude_model,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
-
         try:
-            classified_list = json.loads(raw)
-        except json.JSONDecodeError:
+            if not ollama_is_available():
+                raise RuntimeError("Ollama not available")
+            classified_list = await self.llm.generate_json_async(prompt)
+        except (json.JSONDecodeError, Exception):
             # Fallback: return unclassified
             classified_list = [
                 {"keyword": kw, "intent": "informational", "cluster": "general", "funnel_stage": "TOFU"}

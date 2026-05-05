@@ -5,7 +5,7 @@ import json
 import re
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import anthropic
+from backend.llm import get_llm
 from backend.config import settings
 
 
@@ -60,7 +60,7 @@ Return JSON: {{"score": <int>, "reasoning": "..."}}
 class LocalSEOPageGenerator:
     def __init__(self, db: AsyncSession = None):
         self.db = db
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.llm = get_llm()
 
     async def run(
         self,
@@ -111,17 +111,9 @@ class LocalSEOPageGenerator:
             location=location,
             business_name=business_name,
         )
-        message = self.client.messages.create(
-            model=settings.claude_model,
-            max_tokens=8096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            return self.llm.generate_json(prompt, max_tokens=8096)
+        except Exception:
             return {
                 "title": f"{service} in {location}",
                 "meta_desc": f"Professional {service} services in {location}. Call {business_name} today.",
@@ -133,13 +125,7 @@ class LocalSEOPageGenerator:
 
     async def _doorway_check(self, content: str) -> dict:
         prompt = DOORWAY_CHECK_PROMPT.format(content_preview=content[:2000])
-        message = self.client.messages.create(
-            model=settings.claude_model,
-            max_tokens=256,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            return self.llm.generate_json(prompt, max_tokens=256)
+        except Exception:
             return {"score": 50, "reasoning": "Could not parse doorway check result."}

@@ -6,8 +6,7 @@ from collections import defaultdict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-import anthropic
-from backend.config import settings
+from backend.llm import get_llm
 from backend.models.crawl import CrawlResult
 from backend.models.keyword import Keyword
 
@@ -46,7 +45,7 @@ Only valid JSON.
 class SiloBuilder:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.llm = get_llm()
 
     async def run(self, site_id: int) -> dict:
         """Build silo structure from crawl data."""
@@ -54,7 +53,7 @@ class SiloBuilder:
         if not pages:
             return {"error": "No crawl data found. Run a crawl first."}
 
-        silo_plan = await self._build_silo_with_claude(pages)
+        silo_plan = await self._build_silo(pages)
         orphan_count = len(silo_plan.get("orphan_pages", []))
 
         return {
@@ -74,19 +73,13 @@ class SiloBuilder:
             if c.indexable
         ]
 
-    async def _build_silo_with_claude(self, pages: list[dict]) -> dict:
-        pages_text = json.dumps(pages[:100], indent=2)  # Limit for context window
+    async def _build_silo(self, pages: list[dict]) -> dict:
+        pages_text = json.dumps(pages[:100], indent=2)
         prompt = SILO_PROMPT.format(pages=pages_text)
 
-        message = self.client.messages.create(
-            model=settings.claude_model,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            return self.llm.generate_json(prompt, max_tokens=4096)
+        except Exception:
             return {
                 "pillar_pages": [],
                 "orphan_pages": [],

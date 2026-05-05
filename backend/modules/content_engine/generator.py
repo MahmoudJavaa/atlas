@@ -1,11 +1,11 @@
-"""Content Engine — generates SEO content via Claude with proper structure."""
+"""Content Engine — generates SEO content via Gemini with proper structure."""
 from __future__ import annotations
 
 import json
 import re
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import anthropic
+from backend.llm import get_llm
 from backend.config import settings
 from backend.models.content import ContentPage
 
@@ -46,7 +46,7 @@ Only return valid JSON. No markdown code fences.
 class ContentGenerator:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.llm = get_llm()
 
     async def run(
         self,
@@ -87,21 +87,9 @@ class ContentGenerator:
             page_type=page_type,
             location=location or "N/A",
         )
-        message = self.client.messages.create(
-            model=settings.claude_model,
-            max_tokens=8096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
-
-        # Strip markdown code fences if Claude wraps in them
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            # Return minimal fallback
+            return self.llm.generate_json(prompt, max_tokens=8096)
+        except (json.JSONDecodeError, Exception):
             return {
                 "title": keyword,
                 "meta_desc": f"Learn about {keyword}.",

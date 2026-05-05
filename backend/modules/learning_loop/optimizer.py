@@ -6,8 +6,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-import anthropic
-from backend.config import settings
+from backend.llm import get_llm
 from backend.models.experiment import Experiment
 from backend.models.keyword import Keyword
 from backend.models.content import ContentPage
@@ -40,7 +39,7 @@ Only valid JSON.
 class LearningLoopOptimizer:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.llm = get_llm()
 
     async def run(self, site_id: int) -> dict:
         """Run the weekly learning loop for a site."""
@@ -52,12 +51,12 @@ class LearningLoopOptimizer:
             "site_id": site_id,
             "experiments_evaluated": len(experiments),
             "report": report,
-            "generated_at": datetime.utcnow().isoformat(),
+            "generated_at": datetime.now(tz=None).isoformat(),
         }
 
     async def _evaluate_experiments(self, site_id: int) -> list[dict]:
         """Compare pre/post metrics for recent experiments."""
-        cutoff = datetime.utcnow() - timedelta(days=7)
+        cutoff = datetime.now(tz=None) - timedelta(days=7)
         result = await self.db.execute(
             select(Experiment).where(
                 Experiment.site_id == site_id,
@@ -69,7 +68,6 @@ class LearningLoopOptimizer:
 
         evaluated = []
         for exp in experiments:
-            # Get current keyword positions for target URL
             if exp.target_url:
                 kw_result = await self.db.execute(
                     select(Keyword).where(
@@ -85,7 +83,7 @@ class LearningLoopOptimizer:
                 baseline_position = exp.baseline_metrics.get("avg_position")
 
                 if current_avg_position and baseline_position:
-                    position_change = baseline_position - current_avg_position  # positive = improvement
+                    position_change = baseline_position - current_avg_position
                     if position_change > 2:
                         outcome = "positive"
                         impact_score = min(position_change / 10, 1.0)
@@ -132,15 +130,9 @@ class LearningLoopOptimizer:
             for e in experiments
         ]
         prompt = REPORT_PROMPT.format(experiments=json.dumps(exp_data, indent=2))
-        message = self.client.messages.create(
-            model=settings.claude_model,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            return self.llm.generate_json(prompt, max_tokens=2048)
+        except Exception:
             return {"summary": "Report generation failed.", "wins": [], "losses": [], "neutral": []}
 
     async def _update_experiment_results(self, experiments: list[dict]):
@@ -153,5 +145,5 @@ class LearningLoopOptimizer:
                     "current_position": exp_data.get("current_position"),
                     "position_change": exp_data.get("position_change"),
                 }
-                exp_obj.concluded_at = datetime.utcnow()
+                exp_obj.concluded_at = datetime.now(tz=None)
         await self.db.flush()

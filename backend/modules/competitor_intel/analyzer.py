@@ -5,9 +5,9 @@ import json
 from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import anthropic
 import httpx
 from bs4 import BeautifulSoup
+from backend.llm import get_llm
 from backend.config import settings
 
 
@@ -40,11 +40,10 @@ Only valid JSON. No markdown.
 class CompetitorAnalyzer:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.llm = get_llm()
 
     async def run(self, site_id: int, competitor_domains: list[str], our_domain: str = "") -> dict:
         """Analyze competitors and return gap report."""
-        all_gaps = []
         competitor_data = []
 
         for domain in competitor_domains:
@@ -52,7 +51,7 @@ class CompetitorAnalyzer:
             competitor_data.append({"domain": domain, "pages": pages})
 
         our_keywords = await self._get_our_keywords(site_id)
-        analysis = await self._analyze_with_claude(competitor_data, our_domain, our_keywords)
+        analysis = await self._analyze_gaps(competitor_data, our_domain, our_keywords)
 
         return {
             "competitor_data": competitor_data,
@@ -84,7 +83,6 @@ class CompetitorAnalyzer:
                         "title": result.get("title", ""),
                         "snippet": result.get("snippet", ""),
                     }
-                    # Optionally scrape the page for word count + structure
                     details = await self._scrape_page_details(page["url"])
                     page.update(details)
                     pages.append(page)
@@ -113,7 +111,7 @@ class CompetitorAnalyzer:
         )
         return [row[0] for row in result.fetchall()]
 
-    async def _analyze_with_claude(
+    async def _analyze_gaps(
         self, competitor_data: list[dict], our_domain: str, our_keywords: list[str]
     ) -> dict:
         pages_text = json.dumps(
@@ -128,13 +126,10 @@ class CompetitorAnalyzer:
             our_keywords=", ".join(our_keywords[:30]),
         )
 
-        message = self.client.messages.create(
-            model=settings.claude_model,
-            max_tokens=3000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            from backend.llm import ollama_is_available
+            if not ollama_is_available():
+                raise RuntimeError("Ollama not available")
+            return await self.llm.generate_json_async(prompt, max_tokens=3000)
+        except Exception:
             return {"content_gaps": [], "ranking_factors": [], "recommended_actions": []}

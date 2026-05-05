@@ -47,12 +47,19 @@ class TechnicalSEOCrawler:
 
     async def run(self, site_id: int, start_url: str, max_pages: int = 100) -> list[dict]:
         """Main entry point. Returns list of audit dicts."""
+        import asyncio
         try:
             from playwright.async_api import async_playwright
+            # Quick probe: try to launch Chromium with a 10s timeout.
+            # If it's not installed (common in Docker), this raises immediately → httpx fallback.
+            async def _probe():
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    await browser.close()
+            await asyncio.wait_for(_probe(), timeout=10.0)
             results = await self._crawl_with_playwright(site_id, start_url, max_pages)
-        except ImportError:
-            # Fallback to requests-based crawl (no JS rendering) for testing
-            import httpx
+        except Exception:
+            # Playwright/Chromium unavailable — use httpx (works in all Docker environments)
             results = await self._crawl_with_httpx(site_id, start_url, max_pages)
         return results
 
@@ -105,11 +112,15 @@ class TechnicalSEOCrawler:
 
     async def _crawl_with_httpx(self, site_id: int, start_url: str, max_pages: int) -> list[dict]:
         import httpx
+        import ssl
+        import certifi
+
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
         results = []
         queue = [start_url]
         base_domain = urlparse(start_url).netloc
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15, verify=ssl_context) as client:
             while queue and len(self.visited) < max_pages:
                 url = queue.pop(0)
                 if url in self.visited:
