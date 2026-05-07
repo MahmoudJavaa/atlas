@@ -1,14 +1,19 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, delete
 from pydantic import BaseModel
 from typing import Optional
+from collections import defaultdict
 
 from backend.database import get_db
 from backend.models.crawl import CrawlResult
 from backend.auth import get_current_user
 
-router = APIRouter(prefix="/technical-seo", tags=["technical-seo"], dependencies=[Depends(get_current_user)])
+router = APIRouter(
+    prefix="/technical-seo",
+    tags=["technical-seo"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 class CrawlRequest(BaseModel):
@@ -17,17 +22,9 @@ class CrawlRequest(BaseModel):
     max_pages: int = 100
 
 
-@router.post("/crawl")
-async def trigger_crawl(data: CrawlRequest, background_tasks: BackgroundTasks):
-    """Trigger an async crawl via Celery."""
-    from backend.tasks.crawl_tasks import crawl_site
-    task = crawl_site.delay(data.site_id, data.start_url, data.max_pages)
-    return {"task_id": task.id, "status": "queued"}
-
-
 @router.post("/crawl/sync")
 async def crawl_sync(data: CrawlRequest, db: AsyncSession = Depends(get_db)):
-    """Run crawl synchronously (for small sites / testing)."""
+    """Run crawl synchronously. Deletes old results and replaces with fresh data."""
     from backend.modules.technical_seo.crawler import TechnicalSEOCrawler
     crawler = TechnicalSEOCrawler(db=db)
     results = await crawler.run(
@@ -45,10 +42,14 @@ async def get_crawl_results(
     limit: int = 1000,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get crawl results, optionally filtered by severity."""
-    stmt = select(CrawlResult).where(CrawlResult.site_id == site_id).limit(limit)
-    result = await db.execute(stmt)
-    rows = result.scalars().all()
+    """Get crawl results for a site, sorted by severity score descending."""
+    stmt = (
+        select(CrawlResult)
+        .where(CrawlResult.site_id == site_id)
+        .order_by(CrawlResult.severity_score.desc(), CrawlResult.url)
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
 
     if severity:
         rows = [r for r in rows if r.issues.get(severity)]
@@ -60,8 +61,13 @@ async def get_crawl_results(
             "status_code": r.status_code,
             "title": r.title,
             "meta_desc": r.meta_desc,
+            "canonical": r.canonical,
+            "redirect_url": r.redirect_url,
             "indexable": r.indexable,
             "word_count": r.word_count,
+            "h1_count": r.h1_count,
+            "response_time_ms": r.response_time_ms,
+            "page_depth": r.page_depth,
             "severity_score": r.severity_score,
             "issues": r.issues,
             "crawled_at": r.crawled_at,
@@ -72,41 +78,55 @@ async def get_crawl_results(
 
 @router.get("/results/{site_id}/summary")
 async def get_audit_summary(site_id: int, db: AsyncSession = Depends(get_db)):
-    """Get issue summary counts for a site."""
-    from sqlalchemy import func
+    """Summary stats + per-issue-type breakdown (how many pages affected)."""
 
-    # Total pages + avg severity
-    agg_result = await db.execute(
+    # Totals
+    agg = (await db.execute(
         select(
             func.count(CrawlResult.id).label("total_pages"),
             func.avg(CrawlResult.severity_score).label("avg_severity"),
         ).where(CrawlResult.site_id == site_id)
-    )
-    row = agg_result.one()
+    )).one()
 
-    # Per-page issue counts
-    pages_result = await db.execute(
+    # All issue dicts
+    pages = (await db.execute(
         select(CrawlResult.issues).where(CrawlResult.site_id == site_id)
-    )
-    all_issues = pages_result.scalars().all()
+    )).scalars().all()
 
-    critical_count = 0
-    warning_count = 0
-    info_count = 0
-    for issues in all_issues:
+    critical_count = warning_count = info_count = clean_count = 0
+    issue_frequency: dict[str, int] = defaultdict(int)
+
+    for issues in pages:
         if not isinstance(issues, dict):
             continue
+        has_issue = False
+        for severity in ("critical", "warning", "info"):
+            for msg in issues.get(severity, []):
+                if not msg.startswith("_"):
+                    issue_frequency[msg] += 1
+                    has_issue = True
         if issues.get("critical"):
             critical_count += 1
         if issues.get("warning"):
             warning_count += 1
         if issues.get("info"):
             info_count += 1
+        if not has_issue:
+            clean_count += 1
+
+    # Top issues sorted by frequency
+    top_issues = sorted(
+        [{"issue": k, "pages_affected": v} for k, v in issue_frequency.items()],
+        key=lambda x: x["pages_affected"],
+        reverse=True,
+    )
 
     return {
-        "total_pages": int(row.total_pages or 0),
-        "avg_severity_score": round(float(row.avg_severity or 0), 1),
+        "total_pages": int(agg.total_pages or 0),
+        "avg_severity_score": round(float(agg.avg_severity or 0), 1),
         "critical_count": critical_count,
         "warning_count": warning_count,
         "info_count": info_count,
+        "clean_count": clean_count,
+        "top_issues": top_issues[:20],
     }

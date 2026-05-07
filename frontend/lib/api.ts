@@ -61,12 +61,14 @@ export const bulkReject = (actionIds: number[], note?: string) =>
   api.post("/actions/bulk-reject", { action_ids: actionIds, note }).then((r) => r.data);
 
 // ── Technical SEO ──────────────────────────────────────────────────────────
-export const crawlSite = (data: { site_id: number; start_url: string; max_pages?: number }) =>
-  api.post("/technical-seo/crawl/sync", data).then((r) => r.data);
+export const crawlSite = (siteId: number, startUrl: string, maxPages = 500) =>
+  api.post("/technical-seo/crawl/sync", { site_id: siteId, start_url: startUrl, max_pages: maxPages }).then((r) => r.data);
 export const getCrawlResults = (siteId: number) =>
   api.get(`/technical-seo/results/${siteId}`).then((r) => r.data);
-export const getCrawlSummary = (siteId: number) =>
+export const getAuditSummary = (siteId: number) =>
   api.get(`/technical-seo/results/${siteId}/summary`).then((r) => r.data);
+// legacy alias
+export const getCrawlSummary = getAuditSummary;
 
 // ── Keywords ───────────────────────────────────────────────────────────────
 export const classifyKeywords = (data: { site_id: number; seed_keywords: string[] }) =>

@@ -1,430 +1,409 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { getSites, crawlSite, getCrawlResults } from "@/lib/api";
-import { RefreshCw, AlertTriangle, Info, AlertCircle, X, ExternalLink, CheckCircle, ChevronRight } from "lucide-react";
+import { getSites, crawlSite, getCrawlResults, getAuditSummary } from "@/lib/api";
+import {
+  RefreshCw, AlertTriangle, Info, AlertCircle, X, ExternalLink,
+  CheckCircle, ChevronDown, ChevronUp, Download, Search,
+  Clock, FileText, BarChart2, Zap
+} from "lucide-react";
 
-// ── Issue descriptions & how-to-fix ──────────────────────────────────────────
+// ── Issue metadata ─────────────────────────────────────────────────────────────
 
-const ISSUE_META: Record<string, { label: string; severity: string; description: string; fix: string }> = {
-  // Critical
-  "Missing <title> tag": {
-    label: "Missing title tag",
-    severity: "critical",
-    description: "This page has no <title> tag. Search engines display the title in search results and use it as a primary ranking signal.",
-    fix: "Add a unique, descriptive <title> tag between 40–60 characters. Include your primary keyword near the beginning.",
-  },
-  "No H1 tag": {
-    label: "Missing H1",
-    severity: "critical",
-    description: "The page has no H1 heading. H1 is the main on-page heading and a strong ranking signal for search engines.",
-    fix: "Add exactly one <h1> tag containing your primary keyword for this page. It should describe the page's main topic clearly.",
-  },
-  "Status 4xx": {
-    label: "4xx Error",
-    severity: "critical",
-    description: "This URL returned a 4xx error (not found or forbidden). These pages waste crawl budget and damage user experience.",
-    fix: "If the page was moved, set up a 301 redirect to the new URL. If it no longer exists, return a proper 404 and remove internal links pointing to it.",
-  },
-  "Status 5xx": {
-    label: "5xx Server Error",
-    severity: "critical",
-    description: "The server returned a 5xx error. This indicates a server-side problem that prevents the page from loading.",
-    fix: "Check your server logs for errors. Fix the underlying server issue. If the problem persists, contact your hosting provider.",
-  },
-  "Noindex tag present": {
-    label: "Noindex tag",
-    severity: "critical",
-    description: "A noindex meta tag tells search engines not to index this page. It will not appear in search results.",
-    fix: "Remove the <meta name='robots' content='noindex'> tag if you want this page to rank. Only use noindex on pages you intentionally want to hide from search engines.",
-  },
-  // Warnings
-  "Title too short": {
-    label: "Title too short",
-    severity: "warning",
-    description: "The page title is shorter than 30 characters. Short titles miss keyword opportunities and look thin in search results.",
-    fix: "Expand the title to 40–60 characters. Include your primary keyword and make it compelling for users to click.",
-  },
-  "Title too long": {
-    label: "Title too long",
-    severity: "warning",
-    description: "The title exceeds 60 characters and will be cut off in search results, hiding important information from users.",
-    fix: "Shorten the title to under 60 characters while keeping the primary keyword at the front.",
-  },
-  "Thin content": {
-    label: "Thin content",
-    severity: "warning",
-    description: "The page has fewer than 300 words. Thin content pages are unlikely to rank well and may be seen as low quality by Google.",
-    fix: "Expand the page with at least 500–800 words of original, helpful content that answers user questions about the topic.",
-  },
-  "Multiple H1 tags": {
-    label: "Multiple H1 tags",
-    severity: "warning",
-    description: "Multiple H1 tags confuse search engines about the page's main topic. Each page should have exactly one H1.",
-    fix: "Keep only one <h1> tag — the most important heading. Convert additional H1s to <h2> or lower.",
-  },
-  "No meta description": {
-    label: "Missing meta description",
-    severity: "warning",
-    description: "There is no meta description. While not a direct ranking factor, a good description improves click-through rate from search results.",
-    fix: "Write a compelling meta description of 120–155 characters that summarises the page and includes a call to action.",
-  },
-  "Meta description too long": {
-    label: "Meta description too long",
-    severity: "warning",
-    description: "The meta description exceeds 155 characters and will be truncated in search results.",
-    fix: "Shorten the description to 120–155 characters. Keep the most important information first.",
-  },
-  "Meta description too short": {
-    label: "Meta description too short",
-    severity: "warning",
-    description: "The meta description is very short. This is a missed opportunity to attract clicks from search results.",
-    fix: "Expand the description to 120–155 characters with a clear summary and a call to action.",
-  },
-  // Info
-  "No structured data (JSON-LD) found": {
-    label: "No schema markup",
-    severity: "info",
-    description: "No JSON-LD structured data was found. Schema markup helps search engines understand your content and can enable rich results (stars, FAQs, breadcrumbs, etc.).",
-    fix: "Add relevant JSON-LD schema. For a business: LocalBusiness or Organization. For products: Product schema. For articles: Article schema. Use Google's Structured Data Markup Helper.",
-  },
-  "Missing alt text on images": {
-    label: "Images missing alt text",
-    severity: "info",
-    description: "Some images have no alt text. Alt text helps search engines understand image content and is essential for accessibility.",
-    fix: "Add descriptive alt text to every image. Describe what is in the image and include relevant keywords where natural.",
-  },
+const ISSUE_META: Record<string, { label: string; severity: "critical" | "warning" | "info"; description: string; fix: string }> = {
+  "Missing title tag": { label: "Missing title tag", severity: "critical", description: "No <title> tag found. Search engines display the title in results and use it as a key ranking signal.", fix: "Add a unique <title> between 30–60 chars with your primary keyword near the start." },
+  "Missing H1 tag": { label: "Missing H1", severity: "critical", description: "No H1 heading. H1 tells both users and search engines what this page is about.", fix: "Add exactly one <h1> with your primary keyword. Every page needs one." },
+  "404 Not Found": { label: "404 Not Found", severity: "critical", description: "This URL returned a 404. It wastes crawl budget and breaks user experience.", fix: "Set up a 301 redirect to the correct URL, or remove all internal links pointing here." },
+  "410 Gone": { label: "410 Gone", severity: "critical", description: "Page permanently no longer exists. Make sure this is intentional.", fix: "Remove all internal links to this page and submit a removal request in Google Search Console." },
+  "Noindex tag — page excluded from search": { label: "Noindex", severity: "critical", description: "The noindex meta tag prevents this page from appearing in search results.", fix: "Remove <meta name='robots' content='noindex'> unless you intentionally want this page hidden." },
+  "Slow page load": { label: "Slow page (>3s)", severity: "critical", description: "Page took over 3 seconds to load. Page speed is a Google ranking factor.", fix: "Optimise images, enable caching, use a CDN, and minify CSS/JS. Target under 1.5s." },
+  "Server error": { label: "Server error", severity: "critical", description: "Server returned a 5xx error — page cannot be crawled or served.", fix: "Check your server logs. Fix the underlying server issue or contact your host." },
+  "Title too long": { label: "Title too long", severity: "warning", description: "Title exceeds 60 characters and will be cut off in search results.", fix: "Shorten to under 60 chars. Keep the primary keyword at the front." },
+  "Title too short": { label: "Title too short", severity: "warning", description: "Title under 30 characters — missing keyword opportunities.", fix: "Expand to 40–60 chars with a descriptive, keyword-rich title." },
+  "Missing meta description": { label: "No meta description", severity: "warning", description: "No meta description. A good description improves click-through rate from results.", fix: "Write 120–155 chars summarising the page. Include a call-to-action." },
+  "Meta description too long": { label: "Meta desc too long", severity: "warning", description: "Meta description exceeds 160 chars and will be cut off.", fix: "Shorten to 120–155 chars. Put the most important content first." },
+  "Missing canonical tag": { label: "No canonical", severity: "warning", description: "No canonical tag. Without it, search engines may index duplicate versions of this page.", fix: "Add <link rel='canonical' href='...'> pointing to the preferred URL." },
+  "Thin content": { label: "Thin content", severity: "warning", description: "Under 300 words. Thin pages are unlikely to rank well.", fix: "Expand to at least 500–800 words of original, helpful content." },
+  "Multiple H1 tags": { label: "Multiple H1s", severity: "warning", description: "Multiple H1 tags confuse search engines about the page's main topic.", fix: "Keep only one <h1>. Convert the rest to <h2> or lower." },
+  "Nofollow tag — links not passed": { label: "Nofollow", severity: "warning", description: "Nofollow meta tag prevents link equity passing from this page.", fix: "Remove nofollow unless intentional." },
+  "Duplicate title tag": { label: "Duplicate title", severity: "warning", description: "Another page shares the same title. Duplicate titles confuse search engines.", fix: "Give every page a unique, descriptive title." },
+  "Duplicate meta description": { label: "Duplicate meta desc", severity: "warning", description: "Another page shares the same meta description.", fix: "Write unique meta descriptions for each page." },
+  "Page buried deep": { label: "Deep page", severity: "warning", description: "More than 4 clicks from the homepage. Deep pages get less crawl priority.", fix: "Add internal links from shallower pages. Restructure navigation." },
+  "Page load slow": { label: "Slow page (1.5–3s)", severity: "warning", description: "Load time is 1.5–3 seconds. Users expect pages under 2 seconds.", fix: "Compress images, enable browser caching, reduce unused JavaScript." },
+  "Redirect": { label: "Redirect", severity: "warning", description: "This URL redirects to another URL, wasting crawl budget.", fix: "Update internal links to point directly to the final destination URL." },
+  "No structured data (JSON-LD) found": { label: "No structured data", severity: "info", description: "No JSON-LD schema markup found. Structured data enables rich results in Google.", fix: "Add Schema.org JSON-LD markup (Article, Product, FAQ, etc.) relevant to your page type." },
+  "Missing Open Graph tags": { label: "Missing OG tags", severity: "info", description: "Open Graph tags control how your page looks when shared on social media.", fix: "Add og:title, og:description, and og:image to the <head>." },
+  "image(s) missing alt text": { label: "Images missing alt", severity: "info", description: "Images without alt text are invisible to screen readers and miss keyword opportunities.", fix: "Add descriptive alt attributes to every image." },
+  "No H2 subheadings on long page": { label: "No H2 subheadings", severity: "info", description: "Long pages without H2 headings are hard to read.", fix: "Break content into sections with descriptive H2 subheadings." },
+  "Canonical points to different URL": { label: "Canonicalized away", severity: "info", description: "The canonical points to a different URL — Google will index that URL instead.", fix: "Ensure this is intentional. If not, update canonical to this page's own URL." },
+  "Meta description too short": { label: "Meta desc too short", severity: "info", description: "Meta description under 70 chars — too brief to be compelling.", fix: "Expand to 120–155 chars with a persuasive summary and call-to-action." },
+  "Blocked by robots.txt": { label: "Blocked by robots.txt", severity: "info", description: "This URL is disallowed in robots.txt.", fix: "If this page should be indexed, update robots.txt to allow it." },
 };
 
 function getIssueInfo(issueText: string) {
-  // Try exact match first, then partial match
   if (ISSUE_META[issueText]) return ISSUE_META[issueText];
-  const key = Object.keys(ISSUE_META).find(
-    (k) => issueText.toLowerCase().includes(k.toLowerCase()) || k.toLowerCase().includes(issueText.toLowerCase())
-  );
-  if (key) return ISSUE_META[key];
-  return {
-    label: issueText,
-    severity: "info",
-    description: "This issue was detected during the technical SEO audit.",
-    fix: "Review this issue and resolve it according to SEO best practices.",
-  };
+  const lower = issueText.toLowerCase();
+  for (const [key, meta] of Object.entries(ISSUE_META)) {
+    const keyLower = key.toLowerCase();
+    if (lower.includes(keyLower) || keyLower.includes(lower.replace(/\s*\(.*\)$/, "").trim())) {
+      return meta;
+    }
+  }
+  if (lower.includes("server error") || lower.includes("5xx")) return ISSUE_META["Server error"];
+  if (lower.includes("redirect")) return ISSUE_META["Redirect"];
+  if (lower.includes("slow") || lower.includes("ms)")) return ISSUE_META["Page load slow"];
+  if (lower.includes("alt")) return ISSUE_META["image(s) missing alt text"];
+  if (lower.includes("open graph") || lower.includes("og:")) return ISSUE_META["Missing Open Graph tags"];
+  return { label: issueText, severity: "info" as const, description: issueText, fix: "Review this issue and consult SEO best practices." };
 }
 
-// ── Issue modal ───────────────────────────────────────────────────────────────
+const SEV_STYLE = {
+  critical: "bg-red-900/40 text-red-300 border border-red-700/50",
+  warning:  "bg-amber-900/40 text-amber-300 border border-amber-700/50",
+  info:     "bg-blue-900/40 text-blue-300 border border-blue-700/50",
+};
+const SEV_ICON = {
+  critical: <AlertCircle className="w-3.5 h-3.5" />,
+  warning:  <AlertTriangle className="w-3.5 h-3.5" />,
+  info:     <Info className="w-3.5 h-3.5" />,
+};
 
-function IssueModal({ row, onClose }: { row: any; onClose: () => void }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm" onClick={onClose}>
-      <div
-        className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-2xl max-h-[85vh] overflow-y-auto shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-start justify-between p-5 border-b border-gray-800">
-          <div className="min-w-0 flex-1 pr-4">
-            <a
-              href={row.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-atlas-400 hover:underline text-sm font-mono flex items-center gap-1 truncate"
-            >
-              {row.url} <ExternalLink size={11} className="shrink-0" />
-            </a>
-            <h2 className="text-white font-semibold mt-1 text-lg leading-tight">
-              {row.title || <span className="text-gray-500 italic">No title</span>}
-            </h2>
-          </div>
-          <button
-            onClick={onClose}
-            className="p-1.5 rounded-lg text-gray-500 hover:text-white hover:bg-gray-800 transition-colors shrink-0"
-          >
-            <X size={18} />
-          </button>
-        </div>
-
-        {/* Page stats */}
-        <div className="grid grid-cols-4 gap-3 p-5 border-b border-gray-800">
-          {[
-            { label: "Status", value: row.status_code, color: row.status_code >= 400 ? "text-red-400" : "text-green-400" },
-            { label: "Words", value: row.word_count ?? "—", color: "text-white" },
-            { label: "Indexable", value: row.indexable ? "Yes" : "No", color: row.indexable ? "text-green-400" : "text-red-400" },
-            { label: "Severity", value: row.severity_score ?? "—", color: row.severity_score > 60 ? "text-red-400" : row.severity_score > 30 ? "text-yellow-400" : "text-green-400" },
-          ].map((stat) => (
-            <div key={stat.label} className="text-center bg-gray-800/50 rounded-xl py-3">
-              <p className={`text-lg font-bold ${stat.color}`}>{stat.value}</p>
-              <p className="text-gray-500 text-xs mt-0.5">{stat.label}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Meta info */}
-        <div className="p-5 border-b border-gray-800 space-y-2 text-sm">
-          {row.canonical && (
-            <div className="flex gap-2">
-              <span className="text-gray-500 w-28 shrink-0">Canonical:</span>
-              <span className="text-gray-300 truncate font-mono text-xs">{row.canonical}</span>
-            </div>
-          )}
-          {row.meta_desc && (
-            <div className="flex gap-2">
-              <span className="text-gray-500 w-28 shrink-0">Meta desc:</span>
-              <span className="text-gray-300 text-xs">{row.meta_desc}</span>
-            </div>
-          )}
-        </div>
-
-        {/* Issues with fix descriptions */}
-        <div className="p-5 space-y-3">
-          {(["critical", "warning", "info"] as const).map((level) => {
-            const issues: string[] = row.issues?.[level] ?? [];
-            if (!issues.length) return null;
-            return (
-              <div key={level}>
-                <p className={`text-xs font-bold uppercase tracking-widest mb-2 ${
-                  level === "critical" ? "text-red-400" : level === "warning" ? "text-yellow-400" : "text-blue-400"
-                }`}>
-                  {level === "critical" ? "🔴" : level === "warning" ? "🟡" : "🔵"} {level}
-                </p>
-                <div className="space-y-2">
-                  {issues.map((issue: string, i: number) => {
-                    const meta = getIssueInfo(issue);
-                    return (
-                      <div key={i} className={`rounded-xl p-4 border ${
-                        level === "critical"
-                          ? "bg-red-500/5 border-red-500/20"
-                          : level === "warning"
-                          ? "bg-yellow-500/5 border-yellow-500/20"
-                          : "bg-blue-500/5 border-blue-500/20"
-                      }`}>
-                        <div className="flex items-start gap-2 mb-2">
-                          {level === "critical" && <AlertCircle size={14} className="text-red-400 shrink-0 mt-0.5" />}
-                          {level === "warning" && <AlertTriangle size={14} className="text-yellow-400 shrink-0 mt-0.5" />}
-                          {level === "info" && <Info size={14} className="text-blue-400 shrink-0 mt-0.5" />}
-                          <p className="text-white font-medium text-sm">{meta.label || issue}</p>
-                        </div>
-                        <p className="text-gray-400 text-xs mb-3 leading-relaxed">{meta.description}</p>
-                        <div className="flex items-start gap-2 bg-green-500/5 border border-green-500/20 rounded-lg p-3">
-                          <ChevronRight size={12} className="text-green-400 shrink-0 mt-0.5" />
-                          <p className="text-green-300 text-xs leading-relaxed"><span className="font-semibold">How to fix:</span> {meta.fix}</p>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          })}
-
-          {/* No issues */}
-          {!["critical", "warning", "info"].some((l) => (row.issues?.[l]?.length ?? 0) > 0) && (
-            <div className="text-center py-6">
-              <CheckCircle size={28} className="text-green-400 mx-auto mb-2" />
-              <p className="text-gray-300 font-medium">No issues detected</p>
-              <p className="text-gray-500 text-sm mt-1">This page passed all SEO checks.</p>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
+function exportCSV(rows: any[]) {
+  const headers = ["URL","Status","Title","Words","H1","Response(ms)","Depth","Score","Critical Issues","Warning Issues","Info Issues"];
+  const escape = (v: any) => `"${String(v ?? "").replace(/"/g, "'")}"`;
+  const lines = rows.map((r: any) => [
+    escape(r.url), r.status_code ?? "", escape(r.title ?? ""),
+    r.word_count ?? "", r.h1_count ?? "", r.response_time_ms ?? "", r.page_depth ?? "", r.severity_score ?? "",
+    escape((r.issues?.critical || []).join("; ")),
+    escape((r.issues?.warning || []).join("; ")),
+    escape((r.issues?.info || []).join("; ")),
+  ].join(","));
+  const blob = new Blob([[headers.join(","), ...lines].join("\n")], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `atlas-seo-audit-${Date.now()}.csv`;
+  a.click();
 }
 
-// ── Main page ─────────────────────────────────────────────────────────────────
-
-export default function TechnicalSEO() {
-  const qc = useQueryClient();
+export default function TechnicalSEOPage() {
   const [selectedSiteId, setSelectedSiteId] = useState<number | null>(null);
   const [maxPages, setMaxPages] = useState(500);
-  const [modalRow, setModalRow] = useState<any>(null);
-  const [filterLevel, setFilterLevel] = useState<"all" | "critical" | "warning" | "info">("all");
+  const [filter, setFilter] = useState<"all" | "critical" | "warning" | "info" | "clean">("all");
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState<"score" | "url" | "words" | "speed">("score");
+  const [sortAsc, setSortAsc] = useState(false);
+  const [expandedRow, setExpandedRow] = useState<number | null>(null);
+  const [activeTab, setActiveTab] = useState<"pages" | "issues">("pages");
+  const queryClient = useQueryClient();
 
   const { data: sites = [] } = useQuery({ queryKey: ["sites"], queryFn: getSites });
 
-  // Auto-select first site
   useEffect(() => {
-    if (!selectedSiteId && (sites as any[]).length > 0) {
-      setSelectedSiteId((sites as any[])[0].id);
+    if (sites.length && !selectedSiteId) {
+      const complete = (sites as any[]).find((s: any) => s.onboarding_status === "complete") || (sites as any[])[0];
+      setSelectedSiteId(complete.id);
     }
   }, [sites, selectedSiteId]);
 
-  const { data: results = [], isLoading: resultsLoading } = useQuery({
+  const selectedSite = (sites as any[]).find((s: any) => s.id === selectedSiteId);
+
+  const { data: summary } = useQuery({
+    queryKey: ["audit-summary", selectedSiteId],
+    queryFn: () => getAuditSummary(selectedSiteId!),
+    enabled: !!selectedSiteId,
+  });
+
+  const { data: allResults = [], isLoading: loadingResults } = useQuery({
     queryKey: ["crawl-results", selectedSiteId],
     queryFn: () => getCrawlResults(selectedSiteId!),
     enabled: !!selectedSiteId,
   });
 
   const crawlMutation = useMutation({
-    mutationFn: () => {
-      const site = (sites as any[]).find((s) => s.id === selectedSiteId);
-      return crawlSite({ site_id: selectedSiteId!, start_url: site.url, max_pages: maxPages });
+    mutationFn: () => crawlSite(selectedSiteId!, selectedSite?.url || "", maxPages),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["crawl-results", selectedSiteId] });
+      queryClient.invalidateQueries({ queryKey: ["audit-summary", selectedSiteId] });
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["crawl-results"] }),
   });
 
-  const activeResults = results as any[];
+  const filtered = useMemo(() => {
+    let rows = [...(allResults as any[])];
+    if (filter === "critical") rows = rows.filter((r: any) => r.issues?.critical?.length > 0);
+    else if (filter === "warning") rows = rows.filter((r: any) => r.issues?.warning?.length > 0 && !r.issues?.critical?.length);
+    else if (filter === "info") rows = rows.filter((r: any) => r.issues?.info?.length > 0 && !r.issues?.critical?.length && !r.issues?.warning?.length);
+    else if (filter === "clean") rows = rows.filter((r: any) => !r.issues?.critical?.length && !r.issues?.warning?.length && !r.issues?.info?.length);
+    if (search) rows = rows.filter((r: any) => r.url.toLowerCase().includes(search.toLowerCase()) || (r.title || "").toLowerCase().includes(search.toLowerCase()));
+    rows.sort((a: any, b: any) => {
+      if (sortBy === "score") return sortAsc ? a.severity_score - b.severity_score : b.severity_score - a.severity_score;
+      if (sortBy === "words") return sortAsc ? (a.word_count || 0) - (b.word_count || 0) : (b.word_count || 0) - (a.word_count || 0);
+      if (sortBy === "speed") return sortAsc ? (a.response_time_ms || 0) - (b.response_time_ms || 0) : (b.response_time_ms || 0) - (a.response_time_ms || 0);
+      return sortAsc ? a.url.localeCompare(b.url) : b.url.localeCompare(a.url);
+    });
+    return rows;
+  }, [allResults, filter, search, sortBy, sortAsc]);
 
-  // Filter results
-  const filteredResults = filterLevel === "all"
-    ? activeResults
-    : activeResults.filter((r) => (r.issues?.[filterLevel]?.length ?? 0) > 0);
+  function toggleSort(col: typeof sortBy) {
+    if (sortBy === col) setSortAsc(!sortAsc);
+    else { setSortBy(col); setSortAsc(false); }
+  }
 
-  // Summary counts
-  const criticalCount = activeResults.filter((r) => (r.issues?.critical?.length ?? 0) > 0).length;
-  const warningCount = activeResults.filter((r) => (r.issues?.warning?.length ?? 0) > 0).length;
-  const infoCount = activeResults.filter((r) => (r.issues?.info?.length ?? 0) > 0).length;
-  const cleanCount = activeResults.filter((r) =>
-    !(r.issues?.critical?.length) && !(r.issues?.warning?.length) && !(r.issues?.info?.length)
-  ).length;
+  const SortIcon = ({ col }: { col: typeof sortBy }) =>
+    sortBy === col ? (sortAsc ? <ChevronUp className="w-3 h-3 inline ml-1" /> : <ChevronDown className="w-3 h-3 inline ml-1" />) : null;
 
   return (
-    <div className="space-y-5 max-w-7xl">
-      {modalRow && <IssueModal row={modalRow} onClose={() => setModalRow(null)} />}
+    <div className="p-6 space-y-6 max-w-screen-xl mx-auto">
 
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-white">Technical SEO</h1>
-      </div>
-
-      {/* Controls */}
-      <div className="card flex flex-wrap gap-3 items-end">
+      {/* Header */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <label className="text-xs text-gray-400 mb-1 block">Site</label>
-          <select
-            className="bg-gray-800 border border-gray-700 text-white rounded-lg px-3 py-2 text-sm"
-            value={selectedSiteId || ""}
-            onChange={(e) => setSelectedSiteId(Number(e.target.value))}
-          >
-            <option value="">Select site…</option>
-            {(sites as any[]).map((s) => (
-              <option key={s.id} value={s.id}>{s.name}</option>
-            ))}
-          </select>
+          <h1 className="text-2xl font-bold text-white">Technical SEO</h1>
+          <p className="text-zinc-400 text-sm mt-1">Full-site crawl with 20+ SEO checks per page</p>
         </div>
-        <div>
-          <label className="text-xs text-gray-400 mb-1 block">Max Pages</label>
-          <input
-            type="number"
-            className="bg-gray-800 border border-gray-700 text-white rounded-lg px-3 py-2 text-sm w-28"
-            value={maxPages}
-            onChange={(e) => setMaxPages(Number(e.target.value))}
-            min={1}
-            max={5000}
-            placeholder="All pages"
-          />
-        </div>
-        <button
-          className="btn-primary flex items-center gap-2 disabled:opacity-50"
-          disabled={!selectedSiteId || crawlMutation.isPending}
-          onClick={() => crawlMutation.mutate()}
-        >
-          <RefreshCw size={14} className={crawlMutation.isPending ? "animate-spin" : ""} />
-          {crawlMutation.isPending ? "Crawling…" : "Run Crawl"}
-        </button>
-        {crawlMutation.isPending && (
-          <p className="text-gray-400 text-sm self-end">Crawling entire site — this may take a few minutes…</p>
+        {(allResults as any[]).length > 0 && (
+          <button onClick={() => exportCSV(allResults as any[])} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm transition-colors border border-zinc-700">
+            <Download className="w-4 h-4" /> Export CSV
+          </button>
         )}
       </div>
 
-      {crawlMutation.isSuccess && (
-        <div className="bg-green-900/30 border border-green-800 text-green-400 rounded-lg px-4 py-2 text-sm">
-          ✓ Crawl complete — {crawlMutation.data?.pages_crawled} pages audited.
+      {/* Controls */}
+      <div className="flex flex-wrap gap-3 items-end bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+        <div className="flex-1 min-w-[200px]">
+          <label className="text-xs text-zinc-400 mb-1 block">Site</label>
+          <select value={selectedSiteId || ""} onChange={e => setSelectedSiteId(Number(e.target.value))}
+            className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            {(sites as any[]).map((s: any) => <option key={s.id} value={s.id}>{s.name || s.url}</option>)}
+          </select>
+        </div>
+        <div className="w-32">
+          <label className="text-xs text-zinc-400 mb-1 block">Max Pages</label>
+          <input type="number" min={10} max={2000} value={maxPages} onChange={e => setMaxPages(Number(e.target.value))}
+            className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
+        <button onClick={() => crawlMutation.mutate()} disabled={!selectedSiteId || crawlMutation.isPending}
+          className="flex items-center gap-2 px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-medium text-sm transition-colors">
+          <RefreshCw className={`w-4 h-4 ${crawlMutation.isPending ? "animate-spin" : ""}`} />
+          {crawlMutation.isPending ? "Crawling…" : "Run Crawl"}
+        </button>
+      </div>
+
+      {crawlMutation.isPending && (
+        <div className="bg-blue-950/40 border border-blue-800/50 rounded-xl p-4 flex items-center gap-3">
+          <RefreshCw className="w-5 h-5 text-blue-400 animate-spin flex-shrink-0" />
+          <div>
+            <p className="text-blue-300 font-medium text-sm">Crawl in progress…</p>
+            <p className="text-blue-400/70 text-xs mt-0.5">Analysing up to {maxPages} pages — checking titles, meta, speed, headings, structured data, OG tags, duplicates + more.</p>
+          </div>
         </div>
       )}
 
-      {/* Summary bar */}
-      {activeResults.length > 0 && (
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          {[
-            { label: "Critical", count: criticalCount, level: "critical", color: "text-red-400 bg-red-500/10 border-red-500/20 hover:border-red-500/50" },
-            { label: "Warnings", count: warningCount, level: "warning", color: "text-yellow-400 bg-yellow-500/10 border-yellow-500/20 hover:border-yellow-500/50" },
-            { label: "Info", count: infoCount, level: "info", color: "text-blue-400 bg-blue-500/10 border-blue-500/20 hover:border-blue-500/50" },
-            { label: "Clean", count: cleanCount, level: "all", color: "text-green-400 bg-green-500/10 border-green-500/20 hover:border-green-500/50" },
-          ].map((item) => (
-            <button
-              key={item.label}
-              onClick={() => setFilterLevel(filterLevel === item.level as any ? "all" : item.level as any)}
-              className={`p-3 rounded-xl border text-left transition-all ${item.color} ${filterLevel === item.level ? "ring-1 ring-current" : ""}`}
-            >
-              <p className="text-2xl font-bold">{item.count}</p>
-              <p className="text-xs mt-0.5 opacity-80">{item.label} pages</p>
+      {/* Summary cards */}
+      {(summary as any) && (
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          {([
+            { label: "Total Pages", value: (summary as any).total_pages, icon: <FileText className="w-4 h-4" />, color: "text-zinc-300", bg: "bg-zinc-800/60 border border-zinc-700/40" },
+            { label: "Critical", value: (summary as any).critical_count, icon: <AlertCircle className="w-4 h-4" />, color: "text-red-400", bg: "bg-red-900/20 border border-red-800/40", f: "critical" },
+            { label: "Warnings", value: (summary as any).warning_count, icon: <AlertTriangle className="w-4 h-4" />, color: "text-amber-400", bg: "bg-amber-900/20 border border-amber-800/40", f: "warning" },
+            { label: "Info", value: (summary as any).info_count, icon: <Info className="w-4 h-4" />, color: "text-blue-400", bg: "bg-blue-900/20 border border-blue-800/40", f: "info" },
+            { label: "Clean", value: (summary as any).clean_count ?? 0, icon: <CheckCircle className="w-4 h-4" />, color: "text-emerald-400", bg: "bg-emerald-900/20 border border-emerald-800/40", f: "clean" },
+          ] as any[]).map((card: any) => (
+            <button key={card.label} onClick={() => card.f && setFilter(filter === card.f ? "all" : card.f)}
+              className={`rounded-xl p-4 text-left transition-all ${card.bg} ${card.f && filter === card.f ? "ring-2 ring-white/20" : ""} ${card.f ? "hover:opacity-80 cursor-pointer" : ""}`}>
+              <div className={`flex items-center gap-2 ${card.color} mb-2`}>{card.icon}<span className="text-xs font-medium">{card.label}</span></div>
+              <div className={`text-2xl font-bold ${card.color}`}>{card.value}</div>
             </button>
           ))}
         </div>
       )}
 
-      {/* Results table */}
-      {resultsLoading ? (
-        <div className="card text-center py-10 text-gray-400">Loading crawl data…</div>
-      ) : activeResults.length > 0 ? (
-        <div className="card overflow-hidden p-0">
-          <div className="p-4 border-b border-gray-800 flex items-center justify-between">
-            <h2 className="font-semibold text-white">
-              Crawl Results — {filteredResults.length} of {activeResults.length} pages
-            </h2>
-            <p className="text-xs text-gray-500">Click any row to see issues and fix guidance</p>
+      {/* Tabs */}
+      {(allResults as any[]).length > 0 && (
+        <>
+          <div className="flex gap-1 bg-zinc-900 rounded-lg p-1 w-fit border border-zinc-800">
+            {([["pages", "Pages Table", <FileText className="w-4 h-4" key="f" />], ["issues", "Issues Breakdown", <BarChart2 className="w-4 h-4" key="b" />]] as [string, string, any][]).map(([tab, label, icon]) => (
+              <button key={tab} onClick={() => setActiveTab(tab as any)}
+                className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${activeTab === tab ? "bg-zinc-700 text-white" : "text-zinc-400 hover:text-zinc-200"}`}>
+                {icon}{label}
+              </button>
+            ))}
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-gray-800 text-gray-400 text-xs">
-                  <th className="text-left p-3 font-medium">URL</th>
-                  <th className="text-left p-3 font-medium w-16">Status</th>
-                  <th className="text-left p-3 font-medium max-w-[200px]">Title</th>
-                  <th className="text-left p-3 font-medium w-16">Words</th>
-                  <th className="text-left p-3 font-medium">Issues</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredResults.map((row: any) => (
-                  <tr
-                    key={row.id}
-                    className="border-b border-gray-800/50 hover:bg-gray-800/60 cursor-pointer transition-colors"
-                    onClick={() => setModalRow(row)}
-                  >
-                    <td className="p-3 text-gray-300 max-w-xs truncate font-mono text-xs">{row.url}</td>
-                    <td className="p-3">
-                      <span className={`text-xs font-bold ${row.status_code >= 400 ? "text-red-400" : row.status_code >= 300 ? "text-yellow-400" : "text-green-400"}`}>
-                        {row.status_code}
-                      </span>
-                    </td>
-                    <td className="p-3 text-gray-300 max-w-[200px] truncate text-xs">{row.title || <span className="text-gray-600 italic">No title</span>}</td>
-                    <td className="p-3 text-gray-400 text-xs">{row.word_count ?? "—"}</td>
-                    <td className="p-3">
-                      <div className="flex gap-1 flex-wrap">
-                        {(row.issues?.critical?.length ?? 0) > 0 && (
-                          <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400 border border-red-500/25">
-                            {row.issues.critical.length} critical
+
+          {/* Issues Breakdown */}
+          {activeTab === "issues" && (summary as any)?.top_issues && (
+            <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
+              <div className="p-4 border-b border-zinc-800">
+                <h2 className="text-white font-semibold">Most Common Issues</h2>
+                <p className="text-zinc-400 text-xs mt-0.5">Sorted by pages affected — fix the top issues for maximum impact</p>
+              </div>
+              <div className="divide-y divide-zinc-800">
+                {(summary as any).top_issues.map((item: any, i: number) => {
+                  const meta = getIssueInfo(item.issue);
+                  const pct = Math.round((item.pages_affected / ((summary as any).total_pages || 1)) * 100);
+                  return (
+                    <div key={i} className="p-4 hover:bg-zinc-800/40 transition-colors">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex items-start gap-3 flex-1 min-w-0">
+                          <span className={`mt-0.5 flex-shrink-0 flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${SEV_STYLE[meta.severity]}`}>
+                            {SEV_ICON[meta.severity]}{meta.severity}
                           </span>
-                        )}
-                        {(row.issues?.warning?.length ?? 0) > 0 && (
-                          <span className="text-xs px-1.5 py-0.5 rounded-full bg-yellow-500/15 text-yellow-400 border border-yellow-500/25">
-                            {row.issues.warning.length} warning
-                          </span>
-                        )}
-                        {(row.issues?.info?.length ?? 0) > 0 && (
-                          <span className="text-xs px-1.5 py-0.5 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/25">
-                            {row.issues.info.length} info
-                          </span>
-                        )}
-                        {!(row.issues?.critical?.length) && !(row.issues?.warning?.length) && !(row.issues?.info?.length) && (
-                          <span className="text-xs text-green-400">✓ Clean</span>
-                        )}
+                          <div className="min-w-0">
+                            <p className="text-white text-sm font-medium">{meta.label || item.issue}</p>
+                            <p className="text-zinc-400 text-xs mt-0.5 line-clamp-1">{meta.fix}</p>
+                          </div>
+                        </div>
+                        <div className="text-right flex-shrink-0">
+                          <p className="text-white font-bold text-sm">{item.pages_affected}</p>
+                          <p className="text-zinc-400 text-xs">{pct}% of pages</p>
+                        </div>
                       </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                      <div className="mt-2 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                        <div className={`h-full rounded-full transition-all ${meta.severity === "critical" ? "bg-red-500" : meta.severity === "warning" ? "bg-amber-500" : "bg-blue-500"}`} style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Pages Table */}
+          {activeTab === "pages" && (
+            <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
+              <div className="p-4 border-b border-zinc-800 flex flex-wrap gap-3 items-center">
+                <div className="relative flex-1 min-w-[200px]">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+                  <input type="text" placeholder="Search URL or title…" value={search} onChange={e => setSearch(e.target.value)}
+                    className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <p className="text-zinc-500 text-xs">{filtered.length} of {(allResults as any[]).length} pages</p>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-800 text-zinc-400 text-xs">
+                      <th className="text-left px-4 py-3 font-medium cursor-pointer hover:text-white select-none" onClick={() => toggleSort("url")}>URL <SortIcon col="url" /></th>
+                      <th className="text-center px-3 py-3 font-medium">Status</th>
+                      <th className="text-left px-3 py-3 font-medium cursor-pointer hover:text-white select-none" onClick={() => toggleSort("words")}>Words <SortIcon col="words" /></th>
+                      <th className="text-center px-3 py-3 font-medium cursor-pointer hover:text-white select-none" onClick={() => toggleSort("speed")}><Clock className="w-3 h-3 inline mr-1" />Speed <SortIcon col="speed" /></th>
+                      <th className="text-left px-3 py-3 font-medium">Issues</th>
+                      <th className="text-center px-3 py-3 font-medium cursor-pointer hover:text-white select-none" onClick={() => toggleSort("score")}>Score <SortIcon col="score" /></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800/60">
+                    {filtered.slice(0, 500).map((r: any) => {
+                      const critCount = r.issues?.critical?.length || 0;
+                      const warnCount = r.issues?.warning?.length || 0;
+                      const infoCount = r.issues?.info?.length || 0;
+                      const isExpanded = expandedRow === r.id;
+                      const allIssues = [
+                        ...(r.issues?.critical || []).map((t: string) => ({ text: t, sev: "critical" })),
+                        ...(r.issues?.warning || []).map((t: string) => ({ text: t, sev: "warning" })),
+                        ...(r.issues?.info || []).map((t: string) => ({ text: t, sev: "info" })),
+                      ];
+                      return (
+                        <>
+                          <tr key={r.id} onClick={() => setExpandedRow(isExpanded ? null : r.id)}
+                            className="hover:bg-zinc-800/40 cursor-pointer transition-colors group">
+                            <td className="px-4 py-3 max-w-[280px]">
+                              <div className="truncate text-zinc-200 group-hover:text-white text-xs font-mono">{r.url.replace(/^https?:\/\//, "")}</div>
+                              {r.title && <div className="truncate text-zinc-500 text-xs mt-0.5">{r.title}</div>}
+                            </td>
+                            <td className="px-3 py-3 text-center">
+                              <span className={`text-xs font-mono font-semibold ${r.status_code >= 400 ? "text-red-400" : r.status_code >= 300 ? "text-amber-400" : "text-emerald-400"}`}>{r.status_code || "—"}</span>
+                            </td>
+                            <td className="px-3 py-3 text-zinc-400 text-xs">{r.word_count?.toLocaleString() || "—"}</td>
+                            <td className="px-3 py-3 text-center">
+                              <span className={`text-xs ${(r.response_time_ms || 0) > 3000 ? "text-red-400" : (r.response_time_ms || 0) > 1500 ? "text-amber-400" : "text-zinc-400"}`}>
+                                {r.response_time_ms ? `${r.response_time_ms}ms` : "—"}
+                              </span>
+                            </td>
+                            <td className="px-3 py-3">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {critCount > 0 && <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-red-900/40 text-red-300 border border-red-700/40"><AlertCircle className="w-3 h-3" />{critCount}</span>}
+                                {warnCount > 0 && <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-amber-900/40 text-amber-300 border border-amber-700/40"><AlertTriangle className="w-3 h-3" />{warnCount}</span>}
+                                {infoCount > 0 && <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-blue-900/40 text-blue-300 border border-blue-700/40"><Info className="w-3 h-3" />{infoCount}</span>}
+                                {!critCount && !warnCount && !infoCount && <span className="flex items-center gap-1 text-xs text-emerald-400"><CheckCircle className="w-3 h-3" />Clean</span>}
+                              </div>
+                            </td>
+                            <td className="px-3 py-3 text-center">
+                              <span className={`text-xs font-bold ${r.severity_score >= 50 ? "text-red-400" : r.severity_score >= 20 ? "text-amber-400" : r.severity_score > 0 ? "text-blue-400" : "text-emerald-400"}`}>{r.severity_score}</span>
+                            </td>
+                          </tr>
+                          {isExpanded && (
+                            <tr key={`${r.id}-exp`} className="bg-zinc-800/30">
+                              <td colSpan={6} className="px-6 py-5">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                  <div className="space-y-3">
+                                    <h3 className="text-white font-semibold text-sm">Page Details</h3>
+                                    <div className="space-y-1.5 text-xs">
+                                      {([["URL", r.url, true], ["Title", r.title || "—", false], ["Meta Desc", r.meta_desc || "—", false], ["Canonical", r.canonical || "—", false], ["Redirect to", r.redirect_url || "—", !!r.redirect_url], ["Word Count", r.word_count ? `${r.word_count} words` : "—", false], ["H1 Count", r.h1_count !== null ? String(r.h1_count) : "—", false], ["Response Time", r.response_time_ms ? `${r.response_time_ms}ms` : "—", false], ["Page Depth", r.page_depth !== null ? `${r.page_depth} clicks from home` : "—", false], ["Indexable", r.indexable ? "Yes" : "No", false]] as [string, string, boolean][]).map(([k, v, link]) => (
+                                        <div key={k} className="flex gap-2">
+                                          <span className="text-zinc-500 w-28 flex-shrink-0">{k}</span>
+                                          {link && v !== "—" ? (
+                                            <a href={v} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline truncate flex items-center gap-1">{v}<ExternalLink className="w-3 h-3 flex-shrink-0" /></a>
+                                          ) : (
+                                            <span className="text-zinc-300 break-all">{v}</span>
+                                          )}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                  <div className="space-y-3">
+                                    <h3 className="text-white font-semibold text-sm">Issues & Fixes ({allIssues.length})</h3>
+                                    {allIssues.length === 0 ? (
+                                      <div className="flex items-center gap-2 text-emerald-400 text-sm"><CheckCircle className="w-4 h-4" />No issues — this page is clean!</div>
+                                    ) : (
+                                      <div className="space-y-2">
+                                        {allIssues.map(({ text, sev }: any, i: number) => {
+                                          const meta = getIssueInfo(text);
+                                          return (
+                                            <div key={i} className={`rounded-lg p-3 ${sev === "critical" ? "bg-red-950/40 border border-red-800/40" : sev === "warning" ? "bg-amber-950/40 border border-amber-800/40" : "bg-blue-950/40 border border-blue-800/40"}`}>
+                                              <div className="flex items-center gap-2 mb-1">{SEV_ICON[sev as keyof typeof SEV_ICON]}<span className={`text-xs font-semibold ${sev === "critical" ? "text-red-300" : sev === "warning" ? "text-amber-300" : "text-blue-300"}`}>{meta.label}</span></div>
+                                              <p className="text-zinc-300 text-xs mb-1">{meta.description}</p>
+                                              <p className="text-xs font-medium text-zinc-100">✦ {meta.fix}</p>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </>
+                      );
+                    })}
+                  </tbody>
+                </table>
+
+                {filtered.length === 0 && !loadingResults && !crawlMutation.isPending && (
+                  <div className="text-center py-16 text-zinc-500">
+                    <FileText className="w-10 h-10 mx-auto mb-3 opacity-30" />
+                    <p>{(allResults as any[]).length === 0 ? "No crawl data yet — run a crawl to get started." : "No pages match this filter."}</p>
+                  </div>
+                )}
+                {filtered.length > 500 && (
+                  <div className="px-4 py-3 bg-zinc-800/40 border-t border-zinc-800 text-zinc-500 text-xs text-center">
+                    Showing first 500 of {filtered.length} pages. Export CSV to see all results.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {!(allResults as any[]).length && !crawlMutation.isPending && !loadingResults && (
+        <div className="text-center py-20 text-zinc-500">
+          <Zap className="w-12 h-12 mx-auto mb-4 opacity-20" />
+          <p className="text-lg font-medium text-zinc-400 mb-2">No crawl data yet</p>
+          <p className="text-sm">Select a site and click <strong className="text-white">Run Crawl</strong> to analyse up to {maxPages} pages.</p>
         </div>
-      ) : selectedSiteId ? (
-        <div className="card text-center py-12">
-          <RefreshCw size={28} className="text-gray-700 mx-auto mb-3" />
-          <p className="text-gray-400 font-medium">No crawl data yet</p>
-          <p className="text-gray-600 text-sm mt-1">Run a crawl to see technical SEO issues.</p>
-        </div>
-      ) : null}
+      )}
     </div>
   );
 }
