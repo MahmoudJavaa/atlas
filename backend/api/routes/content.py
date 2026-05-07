@@ -6,8 +6,9 @@ from typing import Optional
 
 from backend.database import get_db
 from backend.models.content import ContentPage
+from backend.auth import get_current_user
 
-router = APIRouter(prefix="/content", tags=["content"])
+router = APIRouter(prefix="/content", tags=["content"], dependencies=[Depends(get_current_user)])
 
 
 class GenerateRequest(BaseModel):

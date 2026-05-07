@@ -5,8 +5,9 @@ from pydantic import BaseModel
 
 from backend.database import get_db
 from backend.models.site import Site
+from backend.auth import get_current_user
 
-router = APIRouter(prefix="/sites", tags=["sites"])
+router = APIRouter(prefix="/sites", tags=["sites"], dependencies=[Depends(get_current_user)])
 
 
 class SiteCreate(BaseModel):

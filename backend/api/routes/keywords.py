@@ -6,8 +6,9 @@ from pydantic import BaseModel
 
 from backend.database import get_db
 from backend.models.keyword import Keyword
+from backend.auth import get_current_user
 
-router = APIRouter(prefix="/keywords", tags=["keywords"])
+router = APIRouter(prefix="/keywords", tags=["keywords"], dependencies=[Depends(get_current_user)])
 
 
 class ClassifyRequest(BaseModel):

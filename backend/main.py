@@ -46,7 +46,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tightened by ALLOWED_ORIGINS in production
+    allow_origins=settings.cors_origins,
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
@@ -72,9 +72,9 @@ app.include_router(agent.router, prefix="/api")
 
 @app.get("/health")
 async def health():
-    from backend.llm import ollama_is_available
+    from backend.llm import llm_is_available
     return {
         "status": "ok",
         "version": "2.0.0",
-        "ai_ready": ollama_is_available(),
+        "ai_ready": llm_is_available(),
     }

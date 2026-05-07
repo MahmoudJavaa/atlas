@@ -6,8 +6,9 @@ from typing import Optional
 
 from backend.database import get_db
 from backend.models.crawl import CrawlResult
+from backend.auth import get_current_user
 
-router = APIRouter(prefix="/technical-seo", tags=["technical-seo"])
+router = APIRouter(prefix="/technical-seo", tags=["technical-seo"], dependencies=[Depends(get_current_user)])
 
 
 class CrawlRequest(BaseModel):
