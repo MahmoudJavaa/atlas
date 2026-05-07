@@ -6,7 +6,6 @@
 dockerfilePath = "backend/Dockerfile"
 
 [deploy]
-startCommand = "python backend/start.py"
 healthcheckPath = "/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 300
 restartPolicyType = "on_failure"
