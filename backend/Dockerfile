@@ -25,4 +25,4 @@ ENV PYTHONUNBUFFERED=1
 
 # Railway / Cloud: start the API server
 # PORT is injected by Railway automatically
-CMD ["/bin/sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["python", "backend/start.py"]
