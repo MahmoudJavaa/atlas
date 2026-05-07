@@ -84,7 +84,7 @@ export default function KeywordsPage() {
   }, [kws]);
 
   const allClusters = useMemo(
-    () => [...new Set(kws.map((k: any) => k.cluster).filter(Boolean))].sort(),
+    () => Array.from(new Set(kws.map((k: any) => k.cluster).filter(Boolean))).sort(),
     [kws]
   );
 
