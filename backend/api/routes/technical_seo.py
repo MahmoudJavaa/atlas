@@ -1,9 +1,20 @@
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete
 from pydantic import BaseModel
 from typing import Optional
 from collections import defaultdict
+
+
+def _normalize_issue(msg: str) -> str:
+    """Collapse dynamic numbers so 'Title too long (72 chars)' groups with '(65 chars)'."""
+    msg = re.sub(r"\(\d+ chars?\)", "", msg)          # "(72 chars)"
+    msg = re.sub(r"\(\d+\)", "", msg)                  # "(2)" in "Multiple H1 tags (2)"
+    msg = re.sub(r"\d+ image\(s\)", "images", msg)    # "9 image(s)" → "images"
+    msg = re.sub(r"\d+ words?\b", "N words", msg)     # "245 words" → "N words"
+    msg = re.sub(r"\d+ms\b", "Nms", msg)              # "3200ms" → "Nms"
+    return msg.strip().rstrip(".")
 
 from backend.database import get_db
 from backend.models.crawl import CrawlResult
@@ -103,7 +114,8 @@ async def get_audit_summary(site_id: int, db: AsyncSession = Depends(get_db)):
         for severity in ("critical", "warning", "info"):
             for msg in issues.get(severity, []):
                 if not msg.startswith("_"):
-                    issue_frequency[msg] += 1
+                    normalized = _normalize_issue(msg)
+                    issue_frequency[normalized] += 1
                     has_issue = True
         if issues.get("critical"):
             critical_count += 1
