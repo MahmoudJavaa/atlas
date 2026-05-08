@@ -71,7 +71,6 @@ async def get_keyword_ideas(
                     "location_code": loc,
                     "limit": limit,
                     "include_seed_keyword": True,
-                    "order_by": ["search_volume,desc"],
                 }
             ]
             try:
