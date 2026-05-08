@@ -326,6 +326,12 @@ export default function KeywordsPage() {
             {refreshMutation.isSuccess && (
               <span className="text-green-400 text-xs">
                 ✓ {(refreshMutation.data as any)?.updated ?? 0} keywords enriched
+                {(refreshMutation.data as any)?.source === "google_trends" && (
+                  <span className="text-gray-500 ml-1">(Google Trends estimates)</span>
+                )}
+                {(refreshMutation.data as any)?.source === "dataforseo" && (
+                  <span className="text-gray-500 ml-1">(real data)</span>
+                )}
               </span>
             )}
             {refreshMutation.isError && (

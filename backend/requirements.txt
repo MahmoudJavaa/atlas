@@ -42,3 +42,6 @@ python-multipart>=0.0.9
 python-dotenv==1.0.1
 certifi>=2024.0.0
 truststore>=0.9.0
+
+# Keyword volume estimation (free Google Trends wrapper)
+pytrends==4.9.2

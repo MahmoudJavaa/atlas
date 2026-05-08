@@ -338,51 +338,71 @@ async def auto_research(
 
 @router.post("/refresh-volumes/{site_id}")
 async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
-    """Re-fetch search volume + difficulty for all existing keywords via DataForSEO.
+    """Re-fetch search volume + difficulty for all existing keywords.
 
-    Safe to call at any time — doesn't delete or reclassify, only updates
-    volume and difficulty columns on rows where DataForSEO returns data.
+    Priority:
+      1. DataForSEO — real Google Ads volume + competition index (requires paid account)
+      2. Google Trends — free relative interest (0–100) as volume proxy + rule-based KD estimate
+
+    Safe to call any time — never deletes or reclassifies, only updates volume/difficulty.
     """
     from backend.modules.keyword_intel.dataforseo import get_search_volume, _is_configured
+    from backend.modules.keyword_intel.trends import get_trends_volume, estimate_difficulty
 
-    if not _is_configured():
-        raise HTTPException(
-            status_code=422,
-            detail="DataForSEO credentials not configured. Add DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD to environment variables.",
-        )
-
-    # Load all keywords grouped by language
     result = await db.execute(
         select(Keyword).where(Keyword.site_id == site_id).limit(2000)
     )
     kws = result.scalars().all()
     if not kws:
-        return {"updated": 0, "total": 0}
+        return {"updated": 0, "total": 0, "source": "none"}
 
     en_kws = [k for k in kws if (k.language or "en") == "en"]
     ar_kws = [k for k in kws if k.language == "ar"]
-
     updated = 0
+    source = "none"
 
-    async def _enrich(bucket: list[Keyword], lang: str):
-        nonlocal updated
-        texts = [k.keyword for k in bucket]
-        vol_map = await get_search_volume(texts, language_code=lang)
-        for kw in bucket:
-            data = vol_map.get(kw.keyword.lower(), {})
-            if data.get("volume") is not None:
-                kw.volume = data["volume"]
+    if _is_configured():
+        # ── DataForSEO: real volume + difficulty ──────────────────────────────
+        source = "dataforseo"
+        for bucket, lang in [(en_kws, "en"), (ar_kws, "ar")]:
+            if not bucket:
+                continue
+            texts = [k.keyword for k in bucket]
+            vol_map = await get_search_volume(texts, language_code=lang)
+            for kw in bucket:
+                data = vol_map.get(kw.keyword.lower(), {})
+                if data.get("volume") is not None:
+                    kw.volume = data["volume"]
+                    updated += 1
+                if data.get("difficulty") is not None:
+                    kw.difficulty = data["difficulty"]
+    else:
+        # ── Google Trends fallback: free relative interest ────────────────────
+        source = "google_trends"
+        all_en_texts = [k.keyword for k in en_kws]
+        all_ar_texts = [k.keyword for k in ar_kws]
+
+        en_scores = await get_trends_volume(all_en_texts[:50], geo="")   # top 50 to avoid throttle
+        ar_scores = await get_trends_volume(all_ar_texts[:50], geo="SA")
+
+        for kw in en_kws:
+            score = en_scores.get(kw.keyword)
+            if score is not None:
+                kw.volume = score        # relative 0–100
                 updated += 1
-            if data.get("difficulty") is not None:
-                kw.difficulty = data["difficulty"]
+            if kw.difficulty is None:
+                kw.difficulty = await estimate_difficulty(kw.keyword)
 
-    if en_kws:
-        await _enrich(en_kws, "en")
-    if ar_kws:
-        await _enrich(ar_kws, "ar")
+        for kw in ar_kws:
+            score = ar_scores.get(kw.keyword)
+            if score is not None:
+                kw.volume = score
+                updated += 1
+            if kw.difficulty is None:
+                kw.difficulty = await estimate_difficulty(kw.keyword)
 
     await db.flush()
-    return {"updated": updated, "total": len(kws)}
+    return {"updated": updated, "total": len(kws), "source": source}
 
 
 @router.get("/{site_id}")
