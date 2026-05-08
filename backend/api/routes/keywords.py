@@ -1,6 +1,7 @@
 """Keyword Intelligence API routes."""
 from __future__ import annotations
 
+import asyncio
 import re
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -377,29 +378,41 @@ async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
                 if data.get("difficulty") is not None:
                     kw.difficulty = data["difficulty"]
     else:
-        # ── Google Trends fallback: free relative interest ────────────────────
-        source = "google_trends"
-        all_en_texts = [k.keyword for k in en_kws]
-        all_ar_texts = [k.keyword for k in ar_kws]
+        # ── Free fallback: rule-based difficulty + optional Google Trends ─────
+        source = "estimated"
 
-        en_scores = await get_trends_volume(all_en_texts[:50], geo="")   # top 50 to avoid throttle
-        ar_scores = await get_trends_volume(all_ar_texts[:50], geo="SA")
-
-        for kw in en_kws:
-            score = en_scores.get(kw.keyword)
-            if score is not None:
-                kw.volume = score        # relative 0–100
-                updated += 1
+        # Step 1: Always set rule-based difficulty instantly (works everywhere)
+        for kw in kws:
             if kw.difficulty is None:
                 kw.difficulty = await estimate_difficulty(kw.keyword)
-
-        for kw in ar_kws:
-            score = ar_scores.get(kw.keyword)
-            if score is not None:
-                kw.volume = score
                 updated += 1
-            if kw.difficulty is None:
-                kw.difficulty = await estimate_difficulty(kw.keyword)
+
+        # Step 2: Try Google Trends for relative volume (may be blocked on cloud)
+        try:
+            en_texts = [k.keyword for k in en_kws if k.volume is None][:30]
+            ar_texts = [k.keyword for k in ar_kws if k.volume is None][:20]
+
+            if en_texts:
+                en_scores = await asyncio.wait_for(
+                    get_trends_volume(en_texts, geo=""), timeout=45
+                )
+                en_map = {k.keyword: k for k in en_kws}
+                for keyword, score in en_scores.items():
+                    if score and keyword in en_map and en_map[keyword].volume is None:
+                        en_map[keyword].volume = score
+                if en_scores:
+                    source = "google_trends"
+
+            if ar_texts:
+                ar_scores = await asyncio.wait_for(
+                    get_trends_volume(ar_texts, geo="SA"), timeout=45
+                )
+                ar_map = {k.keyword: k for k in ar_kws}
+                for keyword, score in ar_scores.items():
+                    if score and keyword in ar_map and ar_map[keyword].volume is None:
+                        ar_map[keyword].volume = score
+        except Exception:
+            pass  # Trends failed — difficulty estimates still saved
 
     await db.flush()
     return {"updated": updated, "total": len(kws), "source": source}
