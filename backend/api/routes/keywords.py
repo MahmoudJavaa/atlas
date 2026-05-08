@@ -48,6 +48,50 @@ def _kw_dict(k: Keyword) -> dict:
     }
 
 
+# Image/file noise patterns — seeds matching these are useless for keyword research
+_IMG_NOISE = re.compile(
+    r"(?:webp|jpeg|jpg|png|gif|svg|avif|scaled|crop|thumb|resize|banner|hero|icon|logo)"
+    r"|\b\d{3,4}x\d{3,4}\b"   # dimensions like 1920x1080
+    r"|\b(?:1080|1440|1600|1920|2048|2560|3840|720|480|360)\b",  # common px values
+    re.IGNORECASE,
+)
+
+def _is_clean_seed(phrase: str) -> bool:
+    """Return True only if the phrase looks like a real keyword topic (not an image filename)."""
+    if _IMG_NOISE.search(phrase):
+        return False
+    # Must have at least one alphabetic word of length >= 3
+    words = phrase.split()
+    alpha_words = [w for w in words if re.match(r"[a-zA-Z؀-ۿ]{3,}", w)]
+    return len(alpha_words) >= 1
+
+
+def _extract_seeds_from_site(site_name: str, site_url: str) -> list[str]:
+    """Derive keyword seeds from the site name and domain when crawl data is poor."""
+    seeds: list[str] = []
+    # From domain: strip TLD, split on hyphens/dots
+    domain = re.sub(r"https?://(?:www\.)?", "", site_url).split("/")[0]
+    domain_parts = re.split(r"[-.]", domain)
+    for part in domain_parts:
+        if len(part) >= 4 and part not in ("com", "net", "org", "app", "www"):
+            seeds.append(part)
+
+    # From site name: split camelCase and spaces
+    name_parts = re.sub(r"([a-z])([A-Z])", r"\1 \2", site_name)  # camelCase → words
+    for word in name_parts.split():
+        word = word.lower().strip()
+        if len(word) >= 4:
+            seeds.append(word)
+
+    # Build common multi-word combos from the site name words
+    words = [s for s in seeds if len(s) >= 4][:5]
+    for i in range(len(words)):
+        for j in range(i + 1, min(i + 3, len(words))):
+            seeds.append(" ".join(words[i:j + 1]))
+
+    return list(dict.fromkeys(seeds))[:20]  # deduplicate preserving order
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/classify/sync")
@@ -56,17 +100,14 @@ async def classify_sync(data: ClassifyRequest, db: AsyncSession = Depends(get_db
     from backend.modules.keyword_intel.classifier import KeywordClassifier
     from backend.modules.keyword_intel.dataforseo import get_search_volume
 
-    # Detect language from keywords (Arabic char check)
     def _detect_lang(kw: str) -> str:
         return "ar" if re.search(r"[؀-ۿ]", kw) else "en"
 
-    # Split into EN and AR buckets
     en_kws = [k for k in data.seed_keywords if _detect_lang(k) == "en"]
     ar_kws = [k for k in data.seed_keywords if _detect_lang(k) == "ar"]
 
     enriched: list[dict] = []
 
-    # Fetch real volume + difficulty from DataForSEO
     if en_kws:
         vol_map = await get_search_volume(en_kws, language_code="en")
         for kw in en_kws:
@@ -83,8 +124,7 @@ async def classify_sync(data: ClassifyRequest, db: AsyncSession = Depends(get_db
         enriched = [{"keyword": k, "volume": None, "difficulty": None, "language": "en"} for k in data.seed_keywords]
 
     classifier = KeywordClassifier(db=db)
-    result = await classifier.run(site_id=data.site_id, seed_keywords=enriched)
-    return result
+    return await classifier.run(site_id=data.site_id, seed_keywords=enriched)
 
 
 @router.post("/auto-research/{site_id}")
@@ -100,7 +140,7 @@ async def auto_research(
       "ar"   — Arabic keywords only
       "both" — English + Arabic (default)
 
-    Falls back to template-based generation when DataForSEO is not configured.
+    Falls back to template-based generation when DataForSEO returns nothing.
     """
     from backend.models.crawl import CrawlResult
     from backend.models.site import Site
@@ -124,7 +164,7 @@ async def auto_research(
             detail="No crawl data found. Run a site crawl first (Technical SEO tab).",
         )
 
-    # ── Extract seed topics from page titles + meta ───────────────────────────
+    # ── Stop word lists ───────────────────────────────────────────────────────
     EN_STOP = {
         "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
         "her", "was", "one", "our", "out", "day", "get", "has", "him", "his",
@@ -137,9 +177,9 @@ async def auto_research(
         "here", "then", "both", "does", "come", "could", "other", "were", "those",
         "only", "many", "after", "about", "them", "these", "made", "where",
         "need", "back", "long", "home", "down", "work", "part", "high", "page",
-        "same", "life", "next", "last",
+        "same", "life", "next", "last", "read", "more", "click", "view", "open",
+        "close", "show", "hide", "type", "size", "copy", "load", "data",
     }
-
     AR_STOP = {
         "في", "من", "على", "إلى", "عن", "مع", "هذا", "هذه", "ذلك", "تلك",
         "التي", "الذي", "كان", "كانت", "يكون", "تكون", "قد", "لقد", "أن",
@@ -148,8 +188,9 @@ async def auto_research(
         "بعد", "قبل", "فوق", "تحت", "أمام", "وراء", "هنا", "هناك", "الان",
     }
 
+    # ── Extract seed topics from page titles + meta ───────────────────────────
     def _clean(text: str) -> str:
-        text = re.sub(r"\s*[-|•·|]\s*.{0,40}$", "", text)
+        text = re.sub(r"\s*[-|•·|]\s*.{0,40}$", "", text)      # strip brand suffix
         text = re.sub(r"[^\w\s؀-ۿ]", " ", text)
         return text.strip().lower()
 
@@ -174,16 +215,70 @@ async def auto_research(
             else:
                 en_topics.update(_phrases(cleaned, EN_STOP))
 
-    en_seeds = [t for t in en_topics if len(t) >= 4][:40]
-    ar_seeds = [t for t in ar_topics if len(t) >= 3][:40]
+    # Filter out image noise (file names, pixel dimensions, format names)
+    en_seeds = [t for t in en_topics if len(t) >= 4 and _is_clean_seed(t)][:40]
+    ar_seeds = [t for t in ar_topics if len(t) >= 3 and _is_clean_seed(t)][:40]
 
-    # ── Determine which languages to research ─────────────────────────────────
+    # ── Fallback: derive seeds from site name + domain ────────────────────────
+    # (needed when all crawl content is images with no real text)
+    if len(en_seeds) < 5:
+        site_url = getattr(site, "url", "") or ""
+        site_name = getattr(site, "name", "") or ""
+        fallback_seeds = _extract_seeds_from_site(site_name, site_url)
+        en_seeds = list(dict.fromkeys(en_seeds + fallback_seeds))[:40]
+
+    # ── Language flags ────────────────────────────────────────────────────────
     do_en = req.language in ("en", "both")
     do_ar = req.language in ("ar", "both")
 
     use_dataforseo = _is_configured()
-
     new_keywords: list[dict] = []
+
+    # ── Template modifier lists (used as fallback) ────────────────────────────
+    EN_MODS = [
+        "what is {t}", "how to {t}", "{t} guide", "{t} tips", "{t} tutorial",
+        "best {t}", "top {t}", "affordable {t}", "professional {t}",
+        "buy {t}", "{t} price", "{t} cost", "{t} near me", "{t} service",
+        "how much does {t} cost", "{t} review", "{t} reviews", "{t} vs",
+        "{t} for beginners", "{t} examples", "{t} help", "{t} benefits",
+        "{t} company", "{t} online", "{t} in egypt", "{t} in cairo",
+        "best {t} egypt", "{t} developer", "{t} project", "{t} investment",
+    ]
+    AR_MODS = [
+        "ما هو {t}", "كيف {t}", "دليل {t}", "نصائح {t}", "أفضل {t}",
+        "سعر {t}", "تكلفة {t}", "شراء {t}", "خدمة {t}", "شركة {t}",
+        "مميزات {t}", "عروض {t}", "خبراء {t}", "{t} للمبتدئين",
+        "{t} في مصر", "{t} في القاهرة", "أفضل {t} مصر", "{t} للبيع",
+        "أسعار {t}", "{t} جديد", "مشاريع {t}",
+    ]
+
+    def _run_template_fallback(seeds_en: list[str], seeds_ar: list[str]) -> list[dict]:
+        result: list[dict] = []
+        if do_en and seeds_en:
+            kws_raw: list[str] = list(seeds_en)
+            for t in seeds_en[:30]:
+                for mod in EN_MODS:
+                    kws_raw.append(mod.format(t=t))
+            seen_t: set[str] = set()
+            for k in kws_raw:
+                k = k.strip()
+                if k and k not in seen_t and len(k) >= 4:
+                    seen_t.add(k)
+                    result.append({"keyword": k, "volume": None, "difficulty": None, "language": "en"})
+            result = result[:700]
+
+        if do_ar and seeds_ar:
+            kws_ar: list[str] = list(seeds_ar)
+            for t in seeds_ar[:20]:
+                for mod in AR_MODS:
+                    kws_ar.append(mod.format(t=t))
+            seen_ar: set[str] = set()
+            for k in kws_ar:
+                k = k.strip()
+                if k and k not in seen_ar and len(k) >= 3:
+                    seen_ar.add(k)
+                    result.append({"keyword": k, "volume": None, "difficulty": None, "language": "ar"})
+        return result
 
     if use_dataforseo:
         # ── Real keyword data from DataForSEO ─────────────────────────────────
@@ -197,7 +292,6 @@ async def auto_research(
             new_keywords.extend(en_ideas[:700])
 
         if do_ar:
-            # Use AR seeds if available, else translate EN seeds conceptually (just use EN seeds)
             seeds_for_ar = ar_seeds if ar_seeds else en_seeds[:20]
             ar_ideas = await get_keyword_ideas(
                 seeds_for_ar,
@@ -207,50 +301,22 @@ async def auto_research(
             )
             new_keywords.extend(ar_ideas[:400])
 
+        # If DataForSEO returned nothing (bad seeds / API issue), fall back to templates
+        if not new_keywords:
+            new_keywords = _run_template_fallback(en_seeds, ar_seeds)
+            use_dataforseo = False  # tell frontend we used fallback
+
     else:
-        # ── Fallback: template-based generation (no real volume) ──────────────
-        EN_MODS = [
-            "what is {t}", "how to {t}", "{t} guide", "{t} tips", "{t} tutorial",
-            "best {t}", "top {t}", "affordable {t}", "professional {t}",
-            "buy {t}", "{t} price", "{t} cost", "{t} near me", "{t} service",
-            "how much does {t} cost", "{t} review", "{t} reviews", "{t} vs",
-            "{t} for beginners", "{t} examples", "{t} help", "{t} benefits",
-        ]
-        AR_MODS = [
-            "ما هو {t}", "كيف {t}", "دليل {t}", "نصائح {t}", "أفضل {t}",
-            "سعر {t}", "تكلفة {t}", "شراء {t}", "خدمة {t}", "شركة {t}",
-            "مميزات {t}", "عروض {t}", "خبراء {t}", "{t} للمبتدئين",
-        ]
-
-        if do_en and en_seeds:
-            kws: list[str] = list(en_seeds)
-            for t in en_seeds[:30]:
-                for mod in EN_MODS:
-                    kws.append(mod.format(t=t))
-            seen: set[str] = set()
-            for k in kws:
-                k = k.strip()
-                if k and k not in seen and len(k) >= 4:
-                    seen.add(k)
-                    new_keywords.append({"keyword": k, "volume": None, "difficulty": None, "language": "en"})
-            new_keywords = new_keywords[:700]
-
-        if do_ar and ar_seeds:
-            kws_ar: list[str] = list(ar_seeds)
-            for t in ar_seeds[:20]:
-                for mod in AR_MODS:
-                    kws_ar.append(mod.format(t=t))
-            seen_ar: set[str] = set()
-            for k in kws_ar:
-                k = k.strip()
-                if k and k not in seen_ar and len(k) >= 3:
-                    seen_ar.add(k)
-                    new_keywords.append({"keyword": k, "volume": None, "difficulty": None, "language": "ar"})
+        # ── No DataForSEO: template-based generation ──────────────────────────
+        new_keywords = _run_template_fallback(en_seeds, ar_seeds)
 
     if not new_keywords:
         raise HTTPException(
             status_code=422,
-            detail="Could not generate keywords. Check that a site crawl has been run.",
+            detail=(
+                f"Could not generate keywords. Seeds found: {len(en_seeds)} EN, "
+                f"{len(ar_seeds)} AR. Check that the site crawl has real page content."
+            ),
         )
 
     # ── Remove keywords already in DB ─────────────────────────────────────────
