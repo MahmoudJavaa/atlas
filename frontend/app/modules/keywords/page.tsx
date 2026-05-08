@@ -3,7 +3,7 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  getSites, autoResearchKeywords, classifyKeywords, getKeywords, deleteKeywords,
+  getSites, autoResearchKeywords, classifyKeywords, getKeywords, deleteKeywords, refreshKeywordVolumes,
 } from "@/lib/api";
 import {
   Zap, Search, Filter, LayoutGrid, Table2, Loader2, AlertCircle,
@@ -167,6 +167,11 @@ export default function KeywordsPage() {
     },
   });
 
+  const refreshMutation = useMutation({
+    mutationFn: () => refreshKeywordVolumes(siteId!),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["keywords", siteId] }),
+  });
+
   // ── Derived data ─────────────────────────────────────────────────────────────
   const kws = keywords as any[];
 
@@ -301,6 +306,32 @@ export default function KeywordsPage() {
               >
                 <Download size={14} /> Export CSV
               </button>
+            )}
+
+            {/* Refresh Volumes */}
+            {kws.length > 0 && (
+              <button
+                className="btn-secondary flex items-center gap-2 text-sm disabled:opacity-50"
+                disabled={refreshMutation.isPending}
+                onClick={() => refreshMutation.mutate()}
+                title="Fetch real search volume + difficulty for all keywords via DataForSEO"
+              >
+                {refreshMutation.isPending ? (
+                  <><Loader2 size={14} className="animate-spin" /> Refreshing…</>
+                ) : (
+                  <><TrendingUp size={14} /> Refresh Volumes</>
+                )}
+              </button>
+            )}
+            {refreshMutation.isSuccess && (
+              <span className="text-green-400 text-xs">
+                ✓ {(refreshMutation.data as any)?.updated ?? 0} keywords enriched
+              </span>
+            )}
+            {refreshMutation.isError && (
+              <span className="text-red-400 text-xs">
+                Volume refresh failed — check DataForSEO credentials
+              </span>
             )}
 
             {/* Clear all */}

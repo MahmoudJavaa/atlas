@@ -336,6 +336,55 @@ async def auto_research(
     }
 
 
+@router.post("/refresh-volumes/{site_id}")
+async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
+    """Re-fetch search volume + difficulty for all existing keywords via DataForSEO.
+
+    Safe to call at any time — doesn't delete or reclassify, only updates
+    volume and difficulty columns on rows where DataForSEO returns data.
+    """
+    from backend.modules.keyword_intel.dataforseo import get_search_volume, _is_configured
+
+    if not _is_configured():
+        raise HTTPException(
+            status_code=422,
+            detail="DataForSEO credentials not configured. Add DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD to environment variables.",
+        )
+
+    # Load all keywords grouped by language
+    result = await db.execute(
+        select(Keyword).where(Keyword.site_id == site_id).limit(2000)
+    )
+    kws = result.scalars().all()
+    if not kws:
+        return {"updated": 0, "total": 0}
+
+    en_kws = [k for k in kws if (k.language or "en") == "en"]
+    ar_kws = [k for k in kws if k.language == "ar"]
+
+    updated = 0
+
+    async def _enrich(bucket: list[Keyword], lang: str):
+        nonlocal updated
+        texts = [k.keyword for k in bucket]
+        vol_map = await get_search_volume(texts, language_code=lang)
+        for kw in bucket:
+            data = vol_map.get(kw.keyword.lower(), {})
+            if data.get("volume") is not None:
+                kw.volume = data["volume"]
+                updated += 1
+            if data.get("difficulty") is not None:
+                kw.difficulty = data["difficulty"]
+
+    if en_kws:
+        await _enrich(en_kws, "en")
+    if ar_kws:
+        await _enrich(ar_kws, "ar")
+
+    await db.flush()
+    return {"updated": updated, "total": len(kws)}
+
+
 @router.get("/{site_id}")
 async def get_keywords(
     site_id: int,

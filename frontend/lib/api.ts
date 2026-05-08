@@ -79,6 +79,8 @@ export const autoResearchKeywords = (siteId: number, language = "both") =>
   api.post(`/keywords/auto-research/${siteId}`, { language }).then((r) => r.data);
 export const deleteKeywords = (siteId: number) =>
   api.delete(`/keywords/${siteId}`).then((r) => r.data);
+export const refreshKeywordVolumes = (siteId: number) =>
+  api.post(`/keywords/refresh-volumes/${siteId}`).then((r) => r.data);
 
 // ── Content ────────────────────────────────────────────────────────────────
 export const generateContent = (data: {
