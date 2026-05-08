@@ -448,7 +448,7 @@ class TechnicalSEOCrawler:
         return disallowed
 
     async def _save_result(self, site_id: int, audit: PageAudit):
-        """Save one page audit to DB. Errors are swallowed so crawl continues."""
+        """Save one page audit using a savepoint so errors never roll back prior results."""
         issues_clean = {k: v for k, v in audit.issues.items() if not k.startswith("_")}
         row = CrawlResult(
             site_id=site_id,
@@ -468,8 +468,9 @@ class TechnicalSEOCrawler:
             severity_score=audit.severity_score,
         )
         try:
-            self.db.add(row)
-            await self.db.flush()
+            # begin_nested() creates a SAVEPOINT — only this row is rolled back on failure,
+            # all previously saved pages in this session are preserved.
+            async with self.db.begin_nested():
+                self.db.add(row)
         except Exception:
-            # Don't let one bad row kill the whole crawl
-            await self.db.rollback()
+            pass  # savepoint auto-rolled-back; parent transaction continues normally

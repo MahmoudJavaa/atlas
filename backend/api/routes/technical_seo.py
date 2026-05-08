@@ -1,7 +1,7 @@
 import re
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func
 from pydantic import BaseModel
 from typing import Optional
 from collections import defaultdict

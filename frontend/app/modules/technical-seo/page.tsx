@@ -125,12 +125,14 @@ export default function TechnicalSEOPage() {
     queryKey: ["audit-summary", selectedSiteId],
     queryFn: () => getAuditSummary(selectedSiteId!),
     enabled: !!selectedSiteId,
+    staleTime: 5 * 60 * 1000,   // crawl data only changes when user runs a crawl
   });
 
   const { data: allResults = [], isLoading: loadingResults } = useQuery({
     queryKey: ["crawl-results", selectedSiteId],
     queryFn: () => getCrawlResults(selectedSiteId!),
     enabled: !!selectedSiteId,
+    staleTime: 5 * 60 * 1000,   // avoid refetching large result sets on window focus
   });
 
   const crawlMutation = useMutation({
