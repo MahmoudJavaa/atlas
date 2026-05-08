@@ -7,7 +7,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from bs4 import BeautifulSoup
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,10 +23,33 @@ _IGNORED_EXT = {
     ".css", ".js", ".json", ".xml", ".woff", ".woff2", ".ttf", ".eot",
 }
 
+# Tracking/analytics query params to strip before deduplication
+_STRIP_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "msclkid", "_ga", "_gid", "ref", "mc_cid", "mc_eid",
+}
+
 
 def _should_skip(url: str) -> bool:
     path = urlparse(url).path.lower()
     return any(path.endswith(ext) for ext in _IGNORED_EXT)
+
+
+def _strip_tracking_params(url: str) -> str:
+    """Remove known tracking query params so /page?utm_source=a and ?utm_source=b dedup."""
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    filtered = {k: v for k, v in params.items() if k.lower() not in _STRIP_PARAMS}
+    new_query = urlencode(filtered, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def _normalize_url(url: str) -> str:
+    """Strip trailing slash (except bare domain) and tracking params."""
+    url = url.rstrip("/") or url
+    return _strip_tracking_params(url)
 
 
 @dataclass
@@ -65,7 +88,7 @@ class PageAudit:
 
 
 class TechnicalSEOCrawler:
-    """Crawls a site, audits each page with 20+ SEO checks, stores results in DB."""
+    """Crawls a site, audits each page with 25+ SEO checks, stores results in DB."""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -73,8 +96,7 @@ class TechnicalSEOCrawler:
         self.crawl_run_id: str = uuid.uuid4().hex
 
     async def run(self, site_id: int, start_url: str, max_pages: int = 100) -> list[dict]:
-        """Main entry point — always uses httpx (works everywhere including Railway)."""
-        # Delete previous crawl results for this site so the UI always shows the latest run
+        """Main entry point — deletes old results, runs crawl, flags duplicates."""
         from sqlalchemy import delete
         await self.db.execute(delete(CrawlResult).where(CrawlResult.site_id == site_id))
         await self.db.flush()
@@ -95,25 +117,22 @@ class TechnicalSEOCrawler:
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
         results: list[dict] = []
 
-        # Normalise start URL (strip trailing slash for consistency)
-        start_url = start_url.rstrip("/") or start_url
+        # Normalise start URL
+        start_url = _normalize_url(start_url)
 
-        # (url, depth) pairs in queue — use deque for O(1) popleft
+        # Queue: (url, depth) — deque for O(1) popleft
         queue: deque[tuple[str, int]] = deque([(start_url, 0)])
-        queued: set[str] = {start_url}  # prevent duplicate queue entries
-        parsed_start = urlparse(start_url)
-        base_domain = parsed_start.netloc
-        # Also accept www <-> non-www variants of the same domain
-        if base_domain.startswith("www."):
-            alt_domain = base_domain[4:]
-        else:
-            alt_domain = f"www.{base_domain}"
+        queued: set[str] = {start_url}
+        base_domain = urlparse(start_url).netloc
+        # Accept both www and non-www variants
+        alt_domain = base_domain[4:] if base_domain.startswith("www.") else f"www.{base_domain}"
 
         # Fetch robots.txt once
         disallowed = await self._fetch_robots(start_url)
 
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=20,
+            follow_redirects=False,          # ← Disabled so we detect 3xx ourselves
+            timeout=20,
             verify=ssl_ctx,
             headers={"User-Agent": "AtlasBot/2.0 SEO-Auditor (+https://atlas.app/bot)"},
         ) as client:
@@ -139,22 +158,6 @@ class TechnicalSEOCrawler:
                     resp = await client.get(url)
                     audit.response_time_ms = int((time.monotonic() - t0) * 1000)
                     audit.status_code = resp.status_code
-
-                    # Track redirect destination
-                    if resp.history:
-                        audit.redirect_url = str(resp.url)
-
-                    # Only parse HTML content — skip JSON, XML, binary, etc.
-                    content_type = resp.headers.get("content-type", "")
-                    if "html" not in content_type:
-                        audit.issues["info"].append(f"Non-HTML response ({content_type.split(';')[0].strip()})")
-                        audit.severity_score = 2
-                        results.append(audit.to_dict())
-                        await self._save_result(site_id, audit)
-                        await asyncio.sleep(0.15)
-                        continue
-
-                    html = resp.text
                 except httpx.TimeoutException:
                     audit.issues["critical"].append("Request timeout (>20s)")
                     audit.severity_score = 100
@@ -162,7 +165,7 @@ class TechnicalSEOCrawler:
                     await self._save_result(site_id, audit)
                     continue
                 except httpx.ConnectError:
-                    audit.issues["critical"].append("Connection failed — host unreachable")
+                    audit.issues["critical"].append("Connection failed")
                     audit.severity_score = 100
                     results.append(audit.to_dict())
                     await self._save_result(site_id, audit)
@@ -174,16 +177,46 @@ class TechnicalSEOCrawler:
                     await self._save_result(site_id, audit)
                     continue
 
-                # Politeness delay — avoid hammering the server
+                # ── Handle redirects (3xx) ──────────────────────────────────
+                if 300 <= audit.status_code < 400:
+                    location = resp.headers.get("location", "")
+                    if location:
+                        dest = _normalize_url(urljoin(url, location))
+                        audit.redirect_url = dest
+                        dest_netloc = urlparse(dest).netloc
+                        # Queue the destination if it's on the same domain
+                        if dest not in self.visited and dest not in queued and dest_netloc in (base_domain, alt_domain):
+                            queue.append((dest, depth))
+                            queued.add(dest)
+                    audit.issues["warning"].append(f"Redirect {audit.status_code}")
+                    audit.severity_score = 10
+                    results.append(audit.to_dict())
+                    await self._save_result(site_id, audit)
+                    await asyncio.sleep(0.15)
+                    continue
+
+                # ── Only parse HTML content ─────────────────────────────────
+                content_type = resp.headers.get("content-type", "")
+                if "html" not in content_type:
+                    audit.issues["info"].append(f"Non-HTML response ({content_type.split(';')[0].strip()})")
+                    audit.severity_score = 2
+                    results.append(audit.to_dict())
+                    await self._save_result(site_id, audit)
+                    await asyncio.sleep(0.15)
+                    continue
+
+                html = resp.text
+
+                # Politeness delay
                 await asyncio.sleep(0.15)
 
-                audit = self._parse_html(audit, html, url, base_domain)
+                audit = self._parse_html(audit, html, url, base_domain, alt_domain)
                 results.append(audit.to_dict())
                 await self._save_result(site_id, audit)
 
-                # Enqueue discovered links — skip already-queued URLs
+                # Enqueue discovered links
                 for link in audit.issues.pop("_links", []):
-                    link = link.rstrip("/") or link  # normalise trailing slash
+                    link = _normalize_url(link)
                     netloc = urlparse(link).netloc
                     if link not in self.visited and link not in queued and netloc in (base_domain, alt_domain):
                         queue.append((link, depth + 1))
@@ -191,14 +224,14 @@ class TechnicalSEOCrawler:
 
         return results
 
-    def _parse_html(self, audit: PageAudit, html: str, url: str, base_domain: str) -> PageAudit:
+    def _parse_html(self, audit: PageAudit, html: str, url: str, base_domain: str, alt_domain: str = "") -> PageAudit:
         soup = BeautifulSoup(html, "html.parser")
 
         # ── HTTPS check ───────────────────────────────────────────────────────
         if url.startswith("http://"):
             audit.issues["critical"].append("Page served over HTTP (not HTTPS)")
 
-        # ── Status code ───────────────────────────────────────────────────────
+        # ── Status code errors ────────────────────────────────────────────────
         sc = audit.status_code
         if sc == 404:
             audit.issues["critical"].append("404 Not Found")
@@ -206,10 +239,8 @@ class TechnicalSEOCrawler:
             audit.issues["critical"].append("410 Gone")
         elif sc >= 500:
             audit.issues["critical"].append(f"Server error {sc}")
-        elif 300 <= sc < 400:
-            audit.issues["warning"].append(f"Redirect {sc}")
 
-        # For error pages (4xx/5xx) skip SEO content checks — they'd all be false positives
+        # Skip content checks for error pages
         if sc >= 400:
             n_crit = len(audit.issues["critical"])
             audit.severity_score = min(n_crit * 30, 100)
@@ -248,11 +279,13 @@ class TechnicalSEOCrawler:
         if not audit.canonical:
             audit.issues["warning"].append("Missing canonical tag")
         else:
-            # Resolve relative canonicals (e.g. /page/) to absolute URL
+            # Resolve relative canonicals before comparing
             canon_abs = urljoin(url, audit.canonical)
             canon_norm = canon_abs.rstrip("/")
             url_norm = url.rstrip("/")
-            if canon_norm != url_norm and urlparse(canon_abs).netloc != urlparse(url).netloc:
+            canon_netloc = urlparse(canon_abs).netloc
+            url_netloc = urlparse(url).netloc
+            if canon_norm != url_norm and canon_netloc not in (url_netloc, base_domain, alt_domain):
                 audit.issues["info"].append("Canonical points to different domain")
             elif canon_norm != url_norm:
                 audit.issues["info"].append("Canonical points to different URL (canonicalized away)")
@@ -291,7 +324,7 @@ class TechnicalSEOCrawler:
 
         # ── Images ────────────────────────────────────────────────────────────
         all_imgs = soup.find_all("img")
-        # alt="" is valid for decorative images — only flag when alt attr is absent
+        # alt="" is valid for decorative images — only flag absent alt attribute
         missing_alt = [img for img in all_imgs if img.get("alt") is None]
         if missing_alt:
             audit.issues["info"].append(f"{len(missing_alt)} image(s) missing alt text")
@@ -307,13 +340,13 @@ class TechnicalSEOCrawler:
             audit.issues["info"].append("No structured data (JSON-LD) found")
 
         # ── Open Graph ────────────────────────────────────────────────────────
-        og_title = soup.find("meta", property="og:title")
-        og_desc = soup.find("meta", property="og:description")
-        og_image = soup.find("meta", property="og:image")
+        og_title = soup.find("meta", attrs={"property": "og:title"})
+        og_desc  = soup.find("meta", attrs={"property": "og:description"})
+        og_image = soup.find("meta", attrs={"property": "og:image"})
         missing_og = []
-        if not og_title: missing_og.append("og:title")
-        if not og_desc: missing_og.append("og:description")
-        if not og_image: missing_og.append("og:image")
+        if not og_title:  missing_og.append("og:title")
+        if not og_desc:   missing_og.append("og:description")
+        if not og_image:  missing_og.append("og:image")
         if missing_og:
             audit.issues["info"].append(f"Missing Open Graph tags: {', '.join(missing_og)}")
 
@@ -322,38 +355,35 @@ class TechnicalSEOCrawler:
             audit.issues["warning"].append(f"Page buried deep ({audit.page_depth} clicks from home)")
 
         # ── Discover internal links ───────────────────────────────────────────
-        # Compute www/alt domain for this parse call
         _netloc = urlparse(url).netloc
         _alt = _netloc[4:] if _netloc.startswith("www.") else f"www.{_netloc}"
-        discovered = set()
+        discovered: set[str] = set()
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
                 continue
-            full = urljoin(url, href).split("#")[0].rstrip("?").rstrip("&").rstrip("/") or urljoin(url, href)
+            full = urljoin(url, href).split("#")[0]
+            full = _normalize_url(full)
             full_netloc = urlparse(full).netloc
             if full_netloc in (_netloc, _alt) and full.startswith("http"):
                 discovered.add(full)
         audit.issues["_links"] = list(discovered)
 
         # ── Severity score ────────────────────────────────────────────────────
-        n_crit = len([i for i in audit.issues["critical"] if not i.startswith("_")])
-        n_warn = len([i for i in audit.issues["warning"] if not i.startswith("_")])
-        n_info = len([i for i in audit.issues["info"] if not i.startswith("_")])
+        n_crit = len(audit.issues["critical"])
+        n_warn = len(audit.issues["warning"])
+        n_info = len(audit.issues["info"])
         audit.severity_score = min(n_crit * 30 + n_warn * 10 + n_info * 2, 100)
 
         return audit
 
     async def _flag_duplicates(self, site_id: int, results: list[dict]):
         """After full crawl, mark pages that share identical title or meta_desc."""
-        from sqlalchemy import update
-        from sqlalchemy import select
+        from sqlalchemy import update, select
 
         title_map: dict[str, list[int]] = defaultdict(list)
-        meta_map: dict[str, list[int]] = defaultdict(list)
+        meta_map:  dict[str, list[int]] = defaultdict(list)
 
-        # Re-fetch the DB rows we just inserted to get their IDs
-        # Filter by crawl_run_id so we only check pages from this run
         stmt = select(CrawlResult).where(
             CrawlResult.site_id == site_id,
             CrawlResult.crawl_run_id == self.crawl_run_id,
@@ -367,26 +397,25 @@ class TechnicalSEOCrawler:
                 meta_map[row.meta_desc.strip().lower()].append(row.id)
 
         dup_title_ids = {rid for ids in title_map.values() if len(ids) > 1 for rid in ids}
-        dup_meta_ids = {rid for ids in meta_map.values() if len(ids) > 1 for rid in ids}
+        dup_meta_ids  = {rid for ids in meta_map.values()  if len(ids) > 1 for rid in ids}
 
         for row in rows:
-            extra_issues = []
+            extra: list[tuple[str, str]] = []
             if row.id in dup_title_ids:
-                extra_issues.append(("warning", "Duplicate title tag"))
+                extra.append(("warning", "Duplicate title tag"))
             if row.id in dup_meta_ids:
-                extra_issues.append(("warning", "Duplicate meta description"))
+                extra.append(("warning", "Duplicate meta description"))
 
-            if extra_issues:
+            if extra:
                 issues = dict(row.issues)
-                for severity, msg in extra_issues:
+                for severity, msg in extra:
                     if msg not in issues.get(severity, []):
                         issues.setdefault(severity, []).append(msg)
-                # Recalc score
                 score = min(
                     len(issues.get("critical", [])) * 30
                     + len(issues.get("warning", [])) * 10
                     + len(issues.get("info", [])) * 2,
-                    100
+                    100,
                 )
                 await self.db.execute(
                     update(CrawlResult)
@@ -395,13 +424,13 @@ class TechnicalSEOCrawler:
                 )
 
     async def _fetch_robots(self, start_url: str) -> list[str]:
-        """Fetch robots.txt and return list of disallowed paths for *, best-effort."""
+        """Fetch robots.txt and return disallowed paths for * or AtlasBot."""
         import httpx
-        disallowed = []
+        disallowed: list[str] = []
         try:
             parsed = urlparse(start_url)
             robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
                 resp = await client.get(robots_url)
                 if resp.status_code == 200:
                     current_ua_matches = False
@@ -419,6 +448,7 @@ class TechnicalSEOCrawler:
         return disallowed
 
     async def _save_result(self, site_id: int, audit: PageAudit):
+        """Save one page audit to DB. Errors are swallowed so crawl continues."""
         issues_clean = {k: v for k, v in audit.issues.items() if not k.startswith("_")}
         row = CrawlResult(
             site_id=site_id,
@@ -437,5 +467,9 @@ class TechnicalSEOCrawler:
             issues=issues_clean,
             severity_score=audit.severity_score,
         )
-        self.db.add(row)
-        await self.db.flush()
+        try:
+            self.db.add(row)
+            await self.db.flush()
+        except Exception:
+            # Don't let one bad row kill the whole crawl
+            await self.db.rollback()

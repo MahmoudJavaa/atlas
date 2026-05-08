@@ -8,12 +8,33 @@ from collections import defaultdict
 
 
 def _normalize_issue(msg: str) -> str:
-    """Collapse dynamic numbers so 'Title too long (72 chars)' groups with '(65 chars)'."""
-    msg = re.sub(r"\(\d+ chars?\)", "", msg)          # "(72 chars)"
-    msg = re.sub(r"\(\d+\)", "", msg)                  # "(2)" in "Multiple H1 tags (2)"
-    msg = re.sub(r"\d+ image\(s\)", "images", msg)    # "9 image(s)" → "images"
-    msg = re.sub(r"\d+ words?\b", "N words", msg)     # "245 words" → "N words"
-    msg = re.sub(r"\d+ms\b", "Nms", msg)              # "3200ms" → "Nms"
+    """Collapse dynamic values so similar issues group together in the breakdown."""
+    # Char counts: "Title too long (72 chars)" → "Title too long"
+    msg = re.sub(r"\s*\(\d+ chars?\)", "", msg)
+    # H1 count: "Multiple H1 tags (3)" → "Multiple H1 tags"
+    msg = re.sub(r"\s*\(\d+\)", "", msg)
+    # Images: "9 image(s) missing alt text" → "images missing alt text"
+    msg = re.sub(r"\d+ image\(s\)", "images", msg)
+    # Word count: "Thin content (245 words)" → "Thin content"
+    msg = re.sub(r"\s*\(\d+ words?\)", "", msg)
+    # Response time: "Slow page load (3200ms)" → "Slow page load"
+    msg = re.sub(r"\s*\(\d+ms\)", "", msg)
+    # Page depth: "Page buried deep (5 clicks from home)" → "Page buried deep"
+    msg = re.sub(r"\s*\(\d+ clicks? from home\)", "", msg)
+    # Redirect code: "Redirect 301" / "Redirect 302" → "Redirect"
+    msg = re.sub(r"^Redirect \d+$", "Redirect", msg)
+    # Server error code: "Server error 503" → "Server error"
+    msg = re.sub(r"^Server error \d+$", "Server error", msg)
+    # OG tags: "Missing Open Graph tags: og:title, og:image" → "Missing Open Graph tags"
+    msg = re.sub(r"^(Missing Open Graph tags):.*$", r"\1", msg)
+    # Non-HTML: "Non-HTML response (application/json)" → "Non-HTML response"
+    msg = re.sub(r"^(Non-HTML response)\s*\(.*\)$", r"\1", msg)
+    # Request failed: "Request failed: SSLError" → "Request failed"
+    msg = re.sub(r"^(Request failed):.*$", r"\1", msg)
+    # Connection failed: "Connection failed — host unreachable" → "Connection failed"
+    msg = re.sub(r"^(Connection failed)\s*[—–-].*$", r"\1", msg)
+    # Request timeout: "Request timeout (>20s)" → "Request timeout"
+    msg = re.sub(r"^(Request timeout)\s*\(.*\)$", r"\1", msg)
     return msg.strip().rstrip(".")
 
 from backend.database import get_db

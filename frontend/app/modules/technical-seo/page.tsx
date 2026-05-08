@@ -4,7 +4,7 @@ import { useState, useEffect, useMemo, Fragment } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { getSites, crawlSite, getCrawlResults, getAuditSummary } from "@/lib/api";
 import {
-  RefreshCw, AlertTriangle, Info, AlertCircle, X, ExternalLink,
+  RefreshCw, AlertTriangle, Info, AlertCircle, ExternalLink,
   CheckCircle, ChevronDown, ChevronUp, Download, Search,
   Clock, FileText, BarChart2, Zap, Activity
 } from "lucide-react";
@@ -42,6 +42,9 @@ const ISSUE_META: Record<string, { label: string; severity: "critical" | "warnin
   "Page served over HTTP (not HTTPS)": { label: "HTTP (not HTTPS)", severity: "critical", description: "Page is served over plain HTTP. HTTPS is a Google ranking signal and required for security.", fix: "Install an SSL certificate and redirect all HTTP traffic to HTTPS." },
   "Missing viewport meta tag (not mobile-friendly)": { label: "No viewport meta tag", severity: "warning", description: "Missing <meta name='viewport'>. Google uses mobile-first indexing — non-mobile-friendly pages rank lower.", fix: "Add <meta name='viewport' content='width=device-width, initial-scale=1'> to the <head>." },
   "Non-HTML response": { label: "Non-HTML response", severity: "info", description: "This URL returns a non-HTML content type (JSON, XML, etc.) — no SEO checks apply.", fix: "Ensure internal links don't point to API or binary endpoints." },
+  "Request timeout": { label: "Request timeout", severity: "critical", description: "Page took more than 20 seconds to respond and the request was abandoned.", fix: "Check server performance, reduce server response time, and ensure the URL is reachable." },
+  "Connection failed": { label: "Connection failed", severity: "critical", description: "The server could not be reached at all — DNS failure or server offline.", fix: "Verify the domain is live and DNS is configured correctly. Check server uptime." },
+  "Request failed": { label: "Request failed", severity: "critical", description: "An unexpected network error prevented this page from being crawled.", fix: "Check SSL certificate validity, server firewall rules, and that the URL is publicly accessible." },
 };
 
 function getIssueInfo(issueText: string) {
@@ -109,6 +112,13 @@ export default function TechnicalSEOPage() {
     }
   }, [sites, selectedSiteId]);
 
+  // Reset UI state when switching sites
+  useEffect(() => {
+    setSearch("");
+    setExpandedRow(null);
+    setFilter("all");
+  }, [selectedSiteId]);
+
   const selectedSite = (sites as any[]).find((s: any) => s.id === selectedSiteId);
 
   const { data: summary } = useQuery({
@@ -128,6 +138,11 @@ export default function TechnicalSEOPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["crawl-results", selectedSiteId] });
       queryClient.invalidateQueries({ queryKey: ["audit-summary", selectedSiteId] });
+      // Reset stale UI state so results are shown cleanly
+      setFilter("all");
+      setExpandedRow(null);
+      setSearch("");
+      setActiveTab("pages");
     },
   });
 
