@@ -96,6 +96,7 @@ async def get_audit_summary(site_id: int, db: AsyncSession = Depends(get_db)):
         select(
             func.count(CrawlResult.id).label("total_pages"),
             func.avg(CrawlResult.severity_score).label("avg_severity"),
+            func.max(CrawlResult.crawled_at).label("last_crawled"),
         ).where(CrawlResult.site_id == site_id)
     )).one()
 
@@ -136,9 +137,10 @@ async def get_audit_summary(site_id: int, db: AsyncSession = Depends(get_db)):
     return {
         "total_pages": int(agg.total_pages or 0),
         "avg_severity_score": round(float(agg.avg_severity or 0), 1),
+        "last_crawled": agg.last_crawled.isoformat() if agg.last_crawled else None,
         "critical_count": critical_count,
         "warning_count": warning_count,
         "info_count": info_count,
         "clean_count": clean_count,
-        "top_issues": top_issues[:20],
+        "top_issues": top_issues[:50],
     }

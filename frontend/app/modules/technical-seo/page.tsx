@@ -1,12 +1,12 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, Fragment } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { getSites, crawlSite, getCrawlResults, getAuditSummary } from "@/lib/api";
 import {
   RefreshCw, AlertTriangle, Info, AlertCircle, X, ExternalLink,
   CheckCircle, ChevronDown, ChevronUp, Download, Search,
-  Clock, FileText, BarChart2, Zap
+  Clock, FileText, BarChart2, Zap, Activity
 } from "lucide-react";
 
 // ── Issue metadata ─────────────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ export default function TechnicalSEOPage() {
     let rows = [...(allResults as any[])];
     if (filter === "critical") rows = rows.filter((r: any) => r.issues?.critical?.length > 0);
     else if (filter === "warning") rows = rows.filter((r: any) => r.issues?.warning?.length > 0 && !r.issues?.critical?.length);
-    else if (filter === "info") rows = rows.filter((r: any) => r.issues?.info?.length > 0 && !r.issues?.critical?.length && !r.issues?.warning?.length);
+    else if (filter === "info") rows = rows.filter((r: any) => r.issues?.info?.length > 0);
     else if (filter === "clean") rows = rows.filter((r: any) => !r.issues?.critical?.length && !r.issues?.warning?.length && !r.issues?.info?.length);
     if (search) rows = rows.filter((r: any) => r.url.toLowerCase().includes(search.toLowerCase()) || (r.title || "").toLowerCase().includes(search.toLowerCase()));
     rows.sort((a: any, b: any) => {
@@ -159,7 +159,23 @@ export default function TechnicalSEOPage() {
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-white">Technical SEO</h1>
-          <p className="text-zinc-400 text-sm mt-1">Full-site crawl with 20+ SEO checks per page</p>
+          <div className="flex items-center gap-3 mt-1 flex-wrap">
+            <p className="text-zinc-400 text-sm">Full-site crawl with 20+ SEO checks per page</p>
+            {(summary as any)?.last_crawled && (
+              <span className="text-xs text-zinc-500 bg-zinc-800 px-2 py-0.5 rounded-full">
+                Last crawled: {new Date((summary as any).last_crawled).toLocaleString()}
+              </span>
+            )}
+            {(summary as any)?.avg_severity_score > 0 && (
+              <span className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${
+                (summary as any).avg_severity_score >= 50 ? "bg-red-900/40 text-red-300" :
+                (summary as any).avg_severity_score >= 20 ? "bg-amber-900/40 text-amber-300" :
+                "bg-emerald-900/40 text-emerald-300"}`}>
+                <Activity className="w-3 h-3" />
+                Avg score: {(summary as any).avg_severity_score}
+              </span>
+            )}
+          </div>
         </div>
         {(allResults as any[]).length > 0 && (
           <button onClick={() => exportCSV(allResults as any[])} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm transition-colors border border-zinc-700">
@@ -194,7 +210,19 @@ export default function TechnicalSEOPage() {
           <RefreshCw className="w-5 h-5 text-blue-400 animate-spin flex-shrink-0" />
           <div>
             <p className="text-blue-300 font-medium text-sm">Crawl in progress…</p>
-            <p className="text-blue-400/70 text-xs mt-0.5">Analysing up to {maxPages} pages — checking titles, meta, speed, headings, structured data, OG tags, duplicates + more.</p>
+            <p className="text-blue-400/70 text-xs mt-0.5">Analysing up to {maxPages} pages — checking titles, meta, speed, headings, structured data, OG tags, duplicates + more. Large sites may take a few minutes.</p>
+          </div>
+        </div>
+      )}
+
+      {crawlMutation.isError && (
+        <div className="bg-red-950/40 border border-red-800/50 rounded-xl p-4 flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-red-300 font-medium text-sm">Crawl failed</p>
+            <p className="text-red-400/70 text-xs mt-0.5">
+              {(crawlMutation.error as any)?.response?.data?.detail || (crawlMutation.error as any)?.message || "An unexpected error occurred. Check that the site URL is correct and the server is reachable."}
+            </p>
           </div>
         </div>
       )}
@@ -231,14 +259,19 @@ export default function TechnicalSEOPage() {
           </div>
 
           {/* Issues Breakdown */}
-          {activeTab === "issues" && (summary as any)?.top_issues && (
+          {activeTab === "issues" && (
             <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
               <div className="p-4 border-b border-zinc-800">
                 <h2 className="text-white font-semibold">Most Common Issues</h2>
                 <p className="text-zinc-400 text-xs mt-0.5">Sorted by pages affected — fix the top issues for maximum impact</p>
               </div>
+              {!(summary as any)?.top_issues?.length && (
+                <div className="py-12 text-center text-zinc-500 text-sm">
+                  {!(summary as any) ? "Loading…" : "No issues found — all pages are clean!"}
+                </div>
+              )}
               <div className="divide-y divide-zinc-800">
-                {(summary as any).top_issues.map((item: any, i: number) => {
+                {((summary as any)?.top_issues || []).map((item: any, i: number) => {
                   const meta = getIssueInfo(item.issue);
                   const pct = Math.round((item.pages_affected / ((summary as any).total_pages || 1)) * 100);
                   return (
@@ -304,8 +337,8 @@ export default function TechnicalSEOPage() {
                         ...(r.issues?.info || []).map((t: string) => ({ text: t, sev: "info" })),
                       ];
                       return (
-                        <>
-                          <tr key={r.id} onClick={() => setExpandedRow(isExpanded ? null : r.id)}
+                        <Fragment key={r.id}>
+                          <tr onClick={() => setExpandedRow(isExpanded ? null : r.id)}
                             className="hover:bg-zinc-800/40 cursor-pointer transition-colors group">
                             <td className="px-4 py-3 max-w-[280px]">
                               <div className="truncate text-zinc-200 group-hover:text-white text-xs font-mono">{r.url.replace(/^https?:\/\//, "")}</div>
@@ -333,7 +366,7 @@ export default function TechnicalSEOPage() {
                             </td>
                           </tr>
                           {isExpanded && (
-                            <tr key={`${r.id}-exp`} className="bg-zinc-800/30">
+                            <tr className="bg-zinc-800/30">
                               <td colSpan={6} className="px-6 py-5">
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                   <div className="space-y-3">
@@ -374,7 +407,7 @@ export default function TechnicalSEOPage() {
                               </td>
                             </tr>
                           )}
-                        </>
+                        </Fragment>
                       );
                     })}
                   </tbody>

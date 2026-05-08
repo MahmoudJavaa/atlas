@@ -1,10 +1,11 @@
 """Technical SEO Crawler — httpx-based with comprehensive SEO checks."""
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
@@ -94,8 +95,9 @@ class TechnicalSEOCrawler:
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
         results: list[dict] = []
 
-        # (url, depth) pairs in queue
-        queue: list[tuple[str, int]] = [(start_url, 0)]
+        # (url, depth) pairs in queue — use deque for O(1) popleft
+        queue: deque[tuple[str, int]] = deque([(start_url, 0)])
+        queued: set[str] = {start_url}  # prevent duplicate queue entries
         base_domain = urlparse(start_url).netloc
 
         # Fetch robots.txt once
@@ -107,7 +109,7 @@ class TechnicalSEOCrawler:
             headers={"User-Agent": "AtlasBot/2.0 SEO-Auditor (+https://atlas.app/bot)"},
         ) as client:
             while queue and len(self.visited) < max_pages:
-                url, depth = queue.pop(0)
+                url, depth = queue.popleft()
                 if url in self.visited or _should_skip(url):
                     continue
                 self.visited.add(url)
@@ -134,6 +136,18 @@ class TechnicalSEOCrawler:
                         audit.redirect_url = str(resp.url)
 
                     html = resp.text
+                except httpx.TimeoutException:
+                    audit.issues["critical"].append("Request timeout (>20s)")
+                    audit.severity_score = 100
+                    results.append(audit.to_dict())
+                    await self._save_result(site_id, audit)
+                    continue
+                except httpx.ConnectError:
+                    audit.issues["critical"].append("Connection failed — host unreachable")
+                    audit.severity_score = 100
+                    results.append(audit.to_dict())
+                    await self._save_result(site_id, audit)
+                    continue
                 except Exception as e:
                     audit.issues["critical"].append(f"Request failed: {type(e).__name__}")
                     audit.severity_score = 100
@@ -141,14 +155,18 @@ class TechnicalSEOCrawler:
                     await self._save_result(site_id, audit)
                     continue
 
+                # Politeness delay — avoid hammering the server
+                await asyncio.sleep(0.15)
+
                 audit = self._parse_html(audit, html, url, base_domain)
                 results.append(audit.to_dict())
                 await self._save_result(site_id, audit)
 
-                # Enqueue discovered links
+                # Enqueue discovered links — skip already-queued URLs
                 for link in audit.issues.pop("_links", []):
-                    if link not in self.visited and urlparse(link).netloc == base_domain:
+                    if link not in self.visited and link not in queued and urlparse(link).netloc == base_domain:
                         queue.append((link, depth + 1))
+                        queued.add(link)
 
         return results
 
@@ -292,8 +310,10 @@ class TechnicalSEOCrawler:
         meta_map: dict[str, list[int]] = defaultdict(list)
 
         # Re-fetch the DB rows we just inserted to get their IDs
-        stmt = select(CrawlResult).where(CrawlResult.site_id == site_id).where(
-            CrawlResult.crawl_run_id == self.crawl_run_id
+        # Filter by crawl_run_id so we only check pages from this run
+        stmt = select(CrawlResult).where(
+            CrawlResult.site_id == site_id,
+            CrawlResult.crawl_run_id == self.crawl_run_id,
         )
         rows = (await self.db.execute(stmt)).scalars().all()
 
