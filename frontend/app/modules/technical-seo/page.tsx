@@ -39,6 +39,9 @@ const ISSUE_META: Record<string, { label: string; severity: "critical" | "warnin
   "Canonical points to different URL": { label: "Canonicalized away", severity: "info", description: "The canonical points to a different URL — Google will index that URL instead.", fix: "Ensure this is intentional. If not, update canonical to this page's own URL." },
   "Meta description too short": { label: "Meta desc too short", severity: "info", description: "Meta description under 70 chars — too brief to be compelling.", fix: "Expand to 120–155 chars with a persuasive summary and call-to-action." },
   "Blocked by robots.txt": { label: "Blocked by robots.txt", severity: "info", description: "This URL is disallowed in robots.txt.", fix: "If this page should be indexed, update robots.txt to allow it." },
+  "Page served over HTTP (not HTTPS)": { label: "HTTP (not HTTPS)", severity: "critical", description: "Page is served over plain HTTP. HTTPS is a Google ranking signal and required for security.", fix: "Install an SSL certificate and redirect all HTTP traffic to HTTPS." },
+  "Missing viewport meta tag (not mobile-friendly)": { label: "No viewport meta tag", severity: "warning", description: "Missing <meta name='viewport'>. Google uses mobile-first indexing — non-mobile-friendly pages rank lower.", fix: "Add <meta name='viewport' content='width=device-width, initial-scale=1'> to the <head>." },
+  "Non-HTML response": { label: "Non-HTML response", severity: "info", description: "This URL returns a non-HTML content type (JSON, XML, etc.) — no SEO checks apply.", fix: "Ensure internal links don't point to API or binary endpoints." },
 };
 
 function getIssueInfo(issueText: string) {
@@ -131,7 +134,7 @@ export default function TechnicalSEOPage() {
   const filtered = useMemo(() => {
     let rows = [...(allResults as any[])];
     if (filter === "critical") rows = rows.filter((r: any) => r.issues?.critical?.length > 0);
-    else if (filter === "warning") rows = rows.filter((r: any) => r.issues?.warning?.length > 0 && !r.issues?.critical?.length);
+    else if (filter === "warning") rows = rows.filter((r: any) => r.issues?.warning?.length > 0);
     else if (filter === "info") rows = rows.filter((r: any) => r.issues?.info?.length > 0);
     else if (filter === "clean") rows = rows.filter((r: any) => !r.issues?.critical?.length && !r.issues?.warning?.length && !r.issues?.info?.length);
     if (search) rows = rows.filter((r: any) => r.url.toLowerCase().includes(search.toLowerCase()) || (r.title || "").toLowerCase().includes(search.toLowerCase()));
@@ -166,15 +169,22 @@ export default function TechnicalSEOPage() {
                 Last crawled: {new Date((summary as any).last_crawled).toLocaleString()}
               </span>
             )}
-            {(summary as any)?.avg_severity_score > 0 && (
-              <span className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${
-                (summary as any).avg_severity_score >= 50 ? "bg-red-900/40 text-red-300" :
-                (summary as any).avg_severity_score >= 20 ? "bg-amber-900/40 text-amber-300" :
-                "bg-emerald-900/40 text-emerald-300"}`}>
-                <Activity className="w-3 h-3" />
-                Avg score: {(summary as any).avg_severity_score}
-              </span>
-            )}
+            {(summary as any)?.total_pages > 0 && (() => {
+              const avg = (summary as any).avg_severity_score ?? 0;
+              const grade = avg <= 5 ? "A" : avg <= 15 ? "B" : avg <= 30 ? "C" : avg <= 50 ? "D" : "F";
+              const color = grade === "A" ? "bg-emerald-900/40 text-emerald-300 border-emerald-700/40"
+                : grade === "B" ? "bg-green-900/40 text-green-300 border-green-700/40"
+                : grade === "C" ? "bg-amber-900/40 text-amber-300 border-amber-700/40"
+                : grade === "D" ? "bg-orange-900/40 text-orange-300 border-orange-700/40"
+                : "bg-red-900/40 text-red-300 border-red-700/40";
+              return (
+                <span className={`text-xs px-2.5 py-0.5 rounded-full flex items-center gap-1.5 border ${color}`}>
+                  <Activity className="w-3 h-3" />
+                  Health Grade: <strong>{grade}</strong>
+                  <span className="opacity-60">({avg}/100 avg score)</span>
+                </span>
+              );
+            })()}
           </div>
         </div>
         {(allResults as any[]).length > 0 && (

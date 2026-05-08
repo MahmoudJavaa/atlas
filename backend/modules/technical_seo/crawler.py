@@ -95,10 +95,19 @@ class TechnicalSEOCrawler:
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
         results: list[dict] = []
 
+        # Normalise start URL (strip trailing slash for consistency)
+        start_url = start_url.rstrip("/") or start_url
+
         # (url, depth) pairs in queue — use deque for O(1) popleft
         queue: deque[tuple[str, int]] = deque([(start_url, 0)])
         queued: set[str] = {start_url}  # prevent duplicate queue entries
-        base_domain = urlparse(start_url).netloc
+        parsed_start = urlparse(start_url)
+        base_domain = parsed_start.netloc
+        # Also accept www <-> non-www variants of the same domain
+        if base_domain.startswith("www."):
+            alt_domain = base_domain[4:]
+        else:
+            alt_domain = f"www.{base_domain}"
 
         # Fetch robots.txt once
         disallowed = await self._fetch_robots(start_url)
@@ -135,6 +144,16 @@ class TechnicalSEOCrawler:
                     if resp.history:
                         audit.redirect_url = str(resp.url)
 
+                    # Only parse HTML content — skip JSON, XML, binary, etc.
+                    content_type = resp.headers.get("content-type", "")
+                    if "html" not in content_type:
+                        audit.issues["info"].append(f"Non-HTML response ({content_type.split(';')[0].strip()})")
+                        audit.severity_score = 2
+                        results.append(audit.to_dict())
+                        await self._save_result(site_id, audit)
+                        await asyncio.sleep(0.15)
+                        continue
+
                     html = resp.text
                 except httpx.TimeoutException:
                     audit.issues["critical"].append("Request timeout (>20s)")
@@ -164,7 +183,9 @@ class TechnicalSEOCrawler:
 
                 # Enqueue discovered links — skip already-queued URLs
                 for link in audit.issues.pop("_links", []):
-                    if link not in self.visited and link not in queued and urlparse(link).netloc == base_domain:
+                    link = link.rstrip("/") or link  # normalise trailing slash
+                    netloc = urlparse(link).netloc
+                    if link not in self.visited and link not in queued and netloc in (base_domain, alt_domain):
                         queue.append((link, depth + 1))
                         queued.add(link)
 
@@ -172,6 +193,10 @@ class TechnicalSEOCrawler:
 
     def _parse_html(self, audit: PageAudit, html: str, url: str, base_domain: str) -> PageAudit:
         soup = BeautifulSoup(html, "html.parser")
+
+        # ── HTTPS check ───────────────────────────────────────────────────────
+        if url.startswith("http://"):
+            audit.issues["critical"].append("Page served over HTTP (not HTTPS)")
 
         # ── Status code ───────────────────────────────────────────────────────
         sc = audit.status_code
@@ -183,6 +208,13 @@ class TechnicalSEOCrawler:
             audit.issues["critical"].append(f"Server error {sc}")
         elif 300 <= sc < 400:
             audit.issues["warning"].append(f"Redirect {sc}")
+
+        # For error pages (4xx/5xx) skip SEO content checks — they'd all be false positives
+        if sc >= 400:
+            n_crit = len(audit.issues["critical"])
+            audit.severity_score = min(n_crit * 30, 100)
+            audit.issues["_links"] = []
+            return audit
 
         # ── Response time ─────────────────────────────────────────────────────
         if audit.response_time_ms > 3000:
@@ -216,10 +248,11 @@ class TechnicalSEOCrawler:
         if not audit.canonical:
             audit.issues["warning"].append("Missing canonical tag")
         else:
-            # Canonical pointing to a different URL = canonicalized away (info)
-            canon_norm = audit.canonical.rstrip("/")
+            # Resolve relative canonicals (e.g. /page/) to absolute URL
+            canon_abs = urljoin(url, audit.canonical)
+            canon_norm = canon_abs.rstrip("/")
             url_norm = url.rstrip("/")
-            if canon_norm != url_norm and urlparse(audit.canonical).netloc != urlparse(url).netloc:
+            if canon_norm != url_norm and urlparse(canon_abs).netloc != urlparse(url).netloc:
                 audit.issues["info"].append("Canonical points to different domain")
             elif canon_norm != url_norm:
                 audit.issues["info"].append("Canonical points to different URL (canonicalized away)")
@@ -258,9 +291,15 @@ class TechnicalSEOCrawler:
 
         # ── Images ────────────────────────────────────────────────────────────
         all_imgs = soup.find_all("img")
-        missing_alt = [img for img in all_imgs if not img.get("alt")]
+        # alt="" is valid for decorative images — only flag when alt attr is absent
+        missing_alt = [img for img in all_imgs if img.get("alt") is None]
         if missing_alt:
             audit.issues["info"].append(f"{len(missing_alt)} image(s) missing alt text")
+
+        # ── Viewport / mobile-friendly ────────────────────────────────────────
+        viewport = soup.find("meta", attrs={"name": re.compile(r"^viewport$", re.I)})
+        if not viewport:
+            audit.issues["warning"].append("Missing viewport meta tag (not mobile-friendly)")
 
         # ── Structured data ───────────────────────────────────────────────────
         schema_tags = soup.find_all("script", attrs={"type": "application/ld+json"})
@@ -283,13 +322,17 @@ class TechnicalSEOCrawler:
             audit.issues["warning"].append(f"Page buried deep ({audit.page_depth} clicks from home)")
 
         # ── Discover internal links ───────────────────────────────────────────
+        # Compute www/alt domain for this parse call
+        _netloc = urlparse(url).netloc
+        _alt = _netloc[4:] if _netloc.startswith("www.") else f"www.{_netloc}"
         discovered = set()
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
                 continue
-            full = urljoin(url, href).split("#")[0].rstrip("?").rstrip("&")
-            if urlparse(full).netloc == base_domain and full.startswith("http"):
+            full = urljoin(url, href).split("#")[0].rstrip("?").rstrip("&").rstrip("/") or urljoin(url, href)
+            full_netloc = urlparse(full).netloc
+            if full_netloc in (_netloc, _alt) and full.startswith("http"):
                 discovered.add(full)
         audit.issues["_links"] = list(discovered)
 
