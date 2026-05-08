@@ -73,10 +73,12 @@ export const getCrawlSummary = getAuditSummary;
 // ── Keywords ───────────────────────────────────────────────────────────────
 export const classifyKeywords = (data: { site_id: number; seed_keywords: string[] }) =>
   api.post("/keywords/classify/sync", data).then((r) => r.data);
-export const getKeywords = (siteId: number, intent?: string, cluster?: string) =>
-  api.get(`/keywords/${siteId}`, { params: { intent, cluster, limit: 1500 } }).then((r) => r.data);
-export const autoResearchKeywords = (siteId: number) =>
-  api.post(`/keywords/auto-research/${siteId}`).then((r) => r.data);
+export const getKeywords = (siteId: number, intent?: string, cluster?: string, language?: string) =>
+  api.get(`/keywords/${siteId}`, { params: { intent, cluster, language, limit: 2000 } }).then((r) => r.data);
+export const autoResearchKeywords = (siteId: number, language = "both") =>
+  api.post(`/keywords/auto-research/${siteId}`, { language }).then((r) => r.data);
+export const deleteKeywords = (siteId: number) =>
+  api.delete(`/keywords/${siteId}`).then((r) => r.data);
 
 // ── Content ────────────────────────────────────────────────────────────────
 export const generateContent = (data: {

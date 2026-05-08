@@ -1,229 +1,301 @@
+"""Keyword Intelligence API routes."""
+from __future__ import annotations
+
 import re
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete as sql_delete
 from pydantic import BaseModel
+from typing import Optional
 
 from backend.database import get_db
 from backend.models.keyword import Keyword
 from backend.auth import get_current_user
 
-router = APIRouter(prefix="/keywords", tags=["keywords"], dependencies=[Depends(get_current_user)])
+router = APIRouter(
+    prefix="/keywords",
+    tags=["keywords"],
+    dependencies=[Depends(get_current_user)],
+)
 
+
+# ── Request models ────────────────────────────────────────────────────────────
 
 class ClassifyRequest(BaseModel):
     site_id: int
     seed_keywords: list[str]
 
 
-@router.post("/classify")
-async def classify_keywords(data: ClassifyRequest):
-    """Queue keyword classification task."""
-    from backend.tasks.keyword_tasks import classify_keywords as task
-    t = task.delay(data.site_id, data.seed_keywords)
-    return {"task_id": t.id, "status": "queued"}
+class ResearchRequest(BaseModel):
+    language: str = "both"  # "en" | "ar" | "both"
+    location_code: Optional[int] = None
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _kw_dict(k: Keyword) -> dict:
+    return {
+        "id": k.id,
+        "keyword": k.keyword,
+        "intent": k.intent,
+        "cluster": k.cluster,
+        "volume": k.volume,
+        "difficulty": k.difficulty,
+        "language": k.language or "en",
+        "position": k.position,
+        "clicks": k.clicks,
+        "impressions": k.impressions,
+    }
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/classify/sync")
 async def classify_sync(data: ClassifyRequest, db: AsyncSession = Depends(get_db)):
-    """Classify keywords synchronously."""
+    """Classify custom seed keywords, enrich with real volume data, and save."""
     from backend.modules.keyword_intel.classifier import KeywordClassifier
+    from backend.modules.keyword_intel.dataforseo import get_search_volume
+
+    # Detect language from keywords (Arabic char check)
+    def _detect_lang(kw: str) -> str:
+        return "ar" if re.search(r"[؀-ۿ]", kw) else "en"
+
+    # Split into EN and AR buckets
+    en_kws = [k for k in data.seed_keywords if _detect_lang(k) == "en"]
+    ar_kws = [k for k in data.seed_keywords if _detect_lang(k) == "ar"]
+
+    enriched: list[dict] = []
+
+    # Fetch real volume + difficulty from DataForSEO
+    if en_kws:
+        vol_map = await get_search_volume(en_kws, language_code="en")
+        for kw in en_kws:
+            v = vol_map.get(kw.lower(), {})
+            enriched.append({"keyword": kw, "volume": v.get("volume"), "difficulty": v.get("difficulty"), "language": "en"})
+
+    if ar_kws:
+        vol_map = await get_search_volume(ar_kws, language_code="ar")
+        for kw in ar_kws:
+            v = vol_map.get(kw.lower(), {})
+            enriched.append({"keyword": kw, "volume": v.get("volume"), "difficulty": v.get("difficulty"), "language": "ar"})
+
+    if not enriched:
+        enriched = [{"keyword": k, "volume": None, "difficulty": None, "language": "en"} for k in data.seed_keywords]
+
     classifier = KeywordClassifier(db=db)
-    result = await classifier.run(site_id=data.site_id, seed_keywords=data.seed_keywords)
+    result = await classifier.run(site_id=data.site_id, seed_keywords=enriched)
     return result
 
 
 @router.post("/auto-research/{site_id}")
-async def auto_research(site_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    Auto-generate 1000+ keywords from the site's crawl data.
-    Extracts topics from page titles/meta, expands with modifier templates,
-    classifies intent, deduplicates, and saves to DB.
+async def auto_research(
+    site_id: int,
+    req: ResearchRequest = ResearchRequest(),
+    db: AsyncSession = Depends(get_db),
+):
+    """Auto-research keywords using DataForSEO for real volume + difficulty.
+
+    Language options:
+      "en"   — English keywords only
+      "ar"   — Arabic keywords only
+      "both" — English + Arabic (default)
+
+    Falls back to template-based generation when DataForSEO is not configured.
     """
     from backend.models.crawl import CrawlResult
     from backend.models.site import Site
     from backend.modules.keyword_intel.classifier import KeywordClassifier
+    from backend.modules.keyword_intel.dataforseo import get_keyword_ideas, _is_configured
 
-    # Get site info
+    # ── Fetch site ────────────────────────────────────────────────────────────
     site_result = await db.execute(select(Site).where(Site.id == site_id))
     site = site_result.scalar_one_or_none()
     if not site:
-        return {"error": "Site not found", "keywords": [], "total": 0}
+        raise HTTPException(status_code=404, detail="Site not found")
 
-    # Get crawl results for topic extraction
+    # ── Fetch crawl data for seed extraction ──────────────────────────────────
     crawl_result = await db.execute(
         select(CrawlResult).where(CrawlResult.site_id == site_id).limit(200)
     )
     pages = crawl_result.scalars().all()
-
     if not pages:
-        return {
-            "error": "No crawl data found. Run a site crawl first.",
-            "keywords": [],
-            "total": 0,
-        }
+        raise HTTPException(
+            status_code=422,
+            detail="No crawl data found. Run a site crawl first (Technical SEO tab).",
+        )
 
-    # ── Step 1: Extract base topics from page titles + meta ──────────────────
-    topics: set[str] = set()
+    # ── Extract seed topics from page titles + meta ───────────────────────────
+    EN_STOP = {
+        "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
+        "her", "was", "one", "our", "out", "day", "get", "has", "him", "his",
+        "how", "man", "new", "now", "old", "see", "two", "way", "who", "boy",
+        "did", "its", "let", "put", "say", "she", "too", "use", "that", "this",
+        "with", "have", "from", "they", "will", "been", "said", "each", "which",
+        "their", "time", "there", "would", "make", "like", "into", "than", "more",
+        "very", "just", "some", "what", "know", "take", "year", "your", "good",
+        "much", "also", "over", "such", "even", "most", "give", "well", "when",
+        "here", "then", "both", "does", "come", "could", "other", "were", "those",
+        "only", "many", "after", "about", "them", "these", "made", "where",
+        "need", "back", "long", "home", "down", "work", "part", "high", "page",
+        "same", "life", "next", "last",
+    }
 
-    def clean_text(text: str) -> str:
-        """Strip brand suffix, punctuation, lowercase."""
-        text = re.sub(r"\s*[-|•·|]\s*.{0,40}$", "", text)  # remove "Brand Name" suffix
-        text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+    AR_STOP = {
+        "في", "من", "على", "إلى", "عن", "مع", "هذا", "هذه", "ذلك", "تلك",
+        "التي", "الذي", "كان", "كانت", "يكون", "تكون", "قد", "لقد", "أن",
+        "إن", "لا", "لم", "لن", "ما", "مما", "أو", "أي", "كل", "بعض",
+        "كما", "حتى", "منذ", "بين", "خلال", "حول", "نحو", "ضد", "عند",
+        "بعد", "قبل", "فوق", "تحت", "أمام", "وراء", "هنا", "هناك", "الان",
+    }
+
+    def _clean(text: str) -> str:
+        text = re.sub(r"\s*[-|•·|]\s*.{0,40}$", "", text)
+        text = re.sub(r"[^\w\s؀-ۿ]", " ", text)
         return text.strip().lower()
 
-    def extract_phrases(text: str) -> list[str]:
-        words = text.split()
-        words = [w for w in words if len(w) > 3 and w not in STOP_WORDS]
-        phrases = []
+    def _phrases(text: str, stop: set) -> list[str]:
+        words = [w for w in text.split() if len(w) > 3 and w not in stop]
+        out: list[str] = []
         for i, w in enumerate(words):
-            phrases.append(w)
+            out.append(w)
             if i + 1 < len(words):
-                phrases.append(f"{words[i]} {words[i+1]}")
+                out.append(f"{words[i]} {words[i+1]}")
             if i + 2 < len(words):
-                phrases.append(f"{words[i]} {words[i+1]} {words[i+2]}")
-        return phrases
+                out.append(f"{words[i]} {words[i+1]} {words[i+2]}")
+        return out
 
+    en_topics: set[str] = set()
+    ar_topics: set[str] = set()
     for page in pages:
-        if page.title:
-            topics.update(extract_phrases(clean_text(page.title)))
-        if page.meta_desc:
-            topics.update(extract_phrases(clean_text(page.meta_desc[:200])))
+        for text in [page.title or "", (page.meta_desc or "")[:200]]:
+            cleaned = _clean(text)
+            if re.search(r"[؀-ۿ]", cleaned):
+                ar_topics.update(_phrases(cleaned, AR_STOP))
+            else:
+                en_topics.update(_phrases(cleaned, EN_STOP))
 
-    # Limit base topics to meaningful ones (3+ chars)
-    base_topics = [t for t in topics if len(t) >= 4][:60]
+    en_seeds = [t for t in en_topics if len(t) >= 4][:40]
+    ar_seeds = [t for t in ar_topics if len(t) >= 3][:40]
 
-    if not base_topics:
-        return {"error": "Could not extract topics from crawl data.", "keywords": [], "total": 0}
+    # ── Determine which languages to research ─────────────────────────────────
+    do_en = req.language in ("en", "both")
+    do_ar = req.language in ("ar", "both")
 
-    # ── Step 2: Expand with modifier templates ───────────────────────────────
-    MODIFIERS = [
-        # Informational
-        "what is {t}",
-        "how to {t}",
-        "{t} guide",
-        "{t} tips",
-        "{t} tutorial",
-        "{t} explained",
-        "{t} for beginners",
-        "{t} examples",
-        "best {t} practices",
-        # Commercial
-        "best {t}",
-        "top {t}",
-        "affordable {t}",
-        "cheap {t}",
-        "premium {t}",
-        "professional {t}",
-        "expert {t}",
-        "trusted {t}",
-        "local {t}",
-        # Transactional
-        "buy {t}",
-        "get {t}",
-        "{t} for sale",
-        "{t} price",
-        "{t} cost",
-        "{t} quote",
-        "order {t}",
-        "{t} near me",
-        "{t} online",
-        "{t} service",
-        "{t} company",
-        "{t} provider",
-        # Questions / long-tail
-        "how much does {t} cost",
-        "where to get {t}",
-        "is {t} worth it",
-        "how long does {t} take",
-        "what does {t} include",
-        "{t} vs",
-        "why {t}",
-        "when to {t}",
-        # Reviews / comparison
-        "{t} review",
-        "{t} reviews",
-        "best {t} 2024",
-        "best {t} 2025",
-        "{t} comparison",
-        "{t} alternatives",
-        # Local / service
-        "{t} specialist",
-        "find {t}",
-        "{t} help",
-        "{t} support",
-        "{t} benefits",
-        "{t} problems",
-        "{t} solutions",
-    ]
+    use_dataforseo = _is_configured()
 
-    seed_keywords: list[str] = list(base_topics)  # include bare topics too
-    for topic in base_topics[:40]:
-        for mod in MODIFIERS:
-            seed_keywords.append(mod.format(t=topic))
+    new_keywords: list[dict] = []
 
-    # Deduplicate preserving order
-    seen: set[str] = set()
-    unique_seeds: list[str] = []
-    for kw in seed_keywords:
-        kw = kw.strip()
-        if kw and kw not in seen and len(kw) >= 4:
-            seen.add(kw)
-            unique_seeds.append(kw)
+    if use_dataforseo:
+        # ── Real keyword data from DataForSEO ─────────────────────────────────
+        if do_en and en_seeds:
+            en_ideas = await get_keyword_ideas(
+                en_seeds,
+                language_code="en",
+                location_code=req.location_code,
+                limit=700,
+            )
+            new_keywords.extend(en_ideas[:700])
 
-    unique_seeds = unique_seeds[:1200]  # cap at 1200
+        if do_ar:
+            # Use AR seeds if available, else translate EN seeds conceptually (just use EN seeds)
+            seeds_for_ar = ar_seeds if ar_seeds else en_seeds[:20]
+            ar_ideas = await get_keyword_ideas(
+                seeds_for_ar,
+                language_code="ar",
+                location_code=req.location_code,
+                limit=400,
+            )
+            new_keywords.extend(ar_ideas[:400])
 
-    # ── Step 3: Remove keywords that already exist in DB ────────────────────
+    else:
+        # ── Fallback: template-based generation (no real volume) ──────────────
+        EN_MODS = [
+            "what is {t}", "how to {t}", "{t} guide", "{t} tips", "{t} tutorial",
+            "best {t}", "top {t}", "affordable {t}", "professional {t}",
+            "buy {t}", "{t} price", "{t} cost", "{t} near me", "{t} service",
+            "how much does {t} cost", "{t} review", "{t} reviews", "{t} vs",
+            "{t} for beginners", "{t} examples", "{t} help", "{t} benefits",
+        ]
+        AR_MODS = [
+            "ما هو {t}", "كيف {t}", "دليل {t}", "نصائح {t}", "أفضل {t}",
+            "سعر {t}", "تكلفة {t}", "شراء {t}", "خدمة {t}", "شركة {t}",
+            "مميزات {t}", "عروض {t}", "خبراء {t}", "{t} للمبتدئين",
+        ]
+
+        if do_en and en_seeds:
+            kws: list[str] = list(en_seeds)
+            for t in en_seeds[:30]:
+                for mod in EN_MODS:
+                    kws.append(mod.format(t=t))
+            seen: set[str] = set()
+            for k in kws:
+                k = k.strip()
+                if k and k not in seen and len(k) >= 4:
+                    seen.add(k)
+                    new_keywords.append({"keyword": k, "volume": None, "difficulty": None, "language": "en"})
+            new_keywords = new_keywords[:700]
+
+        if do_ar and ar_seeds:
+            kws_ar: list[str] = list(ar_seeds)
+            for t in ar_seeds[:20]:
+                for mod in AR_MODS:
+                    kws_ar.append(mod.format(t=t))
+            seen_ar: set[str] = set()
+            for k in kws_ar:
+                k = k.strip()
+                if k and k not in seen_ar and len(k) >= 3:
+                    seen_ar.add(k)
+                    new_keywords.append({"keyword": k, "volume": None, "difficulty": None, "language": "ar"})
+
+    if not new_keywords:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not generate keywords. Check that a site crawl has been run.",
+        )
+
+    # ── Remove keywords already in DB ─────────────────────────────────────────
     existing_result = await db.execute(
         select(Keyword.keyword).where(Keyword.site_id == site_id)
     )
-    existing_kws: set[str] = {row[0].lower() for row in existing_result.all()}
-    new_seeds = [kw for kw in unique_seeds if kw.lower() not in existing_kws]
+    existing_set: set[str] = {row[0].lower() for row in existing_result.all()}
+    fresh = [kw for kw in new_keywords if kw["keyword"].lower() not in existing_set]
 
-    # ── Step 4: Classify + save in batches ───────────────────────────────────
+    # ── Classify intent + save in batches ─────────────────────────────────────
     classifier = KeywordClassifier(db=db)
     BATCH = 60
-    total_classified = 0
+    total_added = 0
 
-    for i in range(0, len(new_seeds), BATCH):
-        batch = new_seeds[i : i + BATCH]
+    for i in range(0, len(fresh), BATCH):
+        batch = fresh[i : i + BATCH]
         try:
             await classifier.run(site_id=site_id, seed_keywords=batch)
-            total_classified += len(batch)
+            total_added += len(batch)
         except Exception:
-            pass  # don't fail entire research if one batch errors
+            pass
 
-    # ── Step 5: Return everything saved for this site ────────────────────────
+    # ── Return all keywords for this site ─────────────────────────────────────
     all_kws_result = await db.execute(
-        select(Keyword).where(Keyword.site_id == site_id).limit(1500)
+        select(Keyword).where(Keyword.site_id == site_id).order_by(
+            Keyword.volume.desc().nullslast(), Keyword.id
+        ).limit(2000)
     )
     all_kws = all_kws_result.scalars().all()
 
     return {
-        "new_keywords_added": total_classified,
+        "new_keywords_added": total_added,
         "total": len(all_kws),
-        "keywords": [
-            {
-                "id": k.id,
-                "keyword": k.keyword,
-                "intent": k.intent,
-                "cluster": k.cluster,
-                "volume": k.volume,
-                "position": k.position,
-                "clicks": k.clicks,
-                "impressions": k.impressions,
-            }
-            for k in all_kws
-        ],
+        "used_dataforseo": use_dataforseo,
+        "keywords": [_kw_dict(k) for k in all_kws],
     }
 
 
 @router.get("/{site_id}")
 async def get_keywords(
     site_id: int,
-    intent: str = None,
-    cluster: str = None,
-    limit: int = 1500,
+    intent: Optional[str] = None,
+    cluster: Optional[str] = None,
+    language: Optional[str] = None,
+    limit: int = 2000,
     db: AsyncSession = Depends(get_db),
 ):
     stmt = select(Keyword).where(Keyword.site_id == site_id)
@@ -231,36 +303,18 @@ async def get_keywords(
         stmt = stmt.where(Keyword.intent == intent)
     if cluster:
         stmt = stmt.where(Keyword.cluster == cluster)
-    stmt = stmt.limit(limit)
+    if language:
+        stmt = stmt.where(Keyword.language == language)
+    stmt = stmt.order_by(Keyword.volume.desc().nullslast(), Keyword.id).limit(limit)
     result = await db.execute(stmt)
-    keywords = result.scalars().all()
-    return [
-        {
-            "id": k.id,
-            "keyword": k.keyword,
-            "intent": k.intent,
-            "cluster": k.cluster,
-            "volume": k.volume,
-            "position": k.position,
-            "clicks": k.clicks,
-            "impressions": k.impressions,
-        }
-        for k in keywords
-    ]
+    return [_kw_dict(k) for k in result.scalars().all()]
 
 
-# ── Common English stop words (to avoid useless topic phrases) ───────────────
-STOP_WORDS = {
-    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
-    "her", "was", "one", "our", "out", "day", "get", "has", "him", "his",
-    "how", "man", "new", "now", "old", "see", "two", "way", "who", "boy",
-    "did", "its", "let", "put", "say", "she", "too", "use", "that", "this",
-    "with", "have", "from", "they", "will", "been", "said", "each", "which",
-    "their", "time", "there", "would", "make", "like", "into", "than", "more",
-    "very", "just", "some", "what", "know", "take", "year", "your", "good",
-    "much", "also", "over", "such", "even", "most", "give", "well", "when",
-    "here", "then", "both", "does", "come", "could", "other", "were", "those",
-    "only", "many", "after", "about", "them", "these", "made", "where",
-    "need", "back", "long", "home", "down", "work", "part", "high", "page",
-    "same", "life", "next", "last",
-}
+@router.delete("/{site_id}")
+async def delete_keywords(site_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete all keywords for a site so research can be re-run from scratch."""
+    result = await db.execute(
+        sql_delete(Keyword).where(Keyword.site_id == site_id)
+    )
+    await db.flush()
+    return {"deleted": result.rowcount}

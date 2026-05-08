@@ -11,8 +11,10 @@ class Keyword(Base):
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), nullable=False, index=True)
     keyword: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
     volume: Mapped[int] = mapped_column(Integer, nullable=True)
+    difficulty: Mapped[int] = mapped_column(Integer, nullable=True)  # 0–100 keyword difficulty (competition_index)
     intent: Mapped[str] = mapped_column(String(50), nullable=True)  # informational | commercial | transactional | navigational
     cluster: Mapped[str] = mapped_column(String(255), nullable=True)
+    language: Mapped[str] = mapped_column(String(10), nullable=True, default="en")  # en | ar
     position: Mapped[float] = mapped_column(Float, nullable=True)
     url: Mapped[str] = mapped_column(String(2048), nullable=True)
     impressions: Mapped[int] = mapped_column(Integer, nullable=True)

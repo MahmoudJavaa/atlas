@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # ── Search APIs (optional) ────────────────────────────────────────────────
     serpapi_key: str = ""
     scrapingbee_key: str = ""
+    # DataForSEO — real keyword volume + difficulty (supports EN + AR)
+    # Sign up free at https://dataforseo.com — get login + password from dashboard
+    dataforseo_login: str = ""
+    dataforseo_password: str = ""
 
     # ── Google OAuth (optional — for Search Console) ──────────────────────────
     google_client_id: str = ""

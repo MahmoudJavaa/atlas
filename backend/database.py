@@ -49,6 +49,9 @@ async def _migrate_columns(conn):
         "ALTER TABLE crawl_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
         "ALTER TABLE crawl_results ADD COLUMN IF NOT EXISTS redirect_url VARCHAR(2048)",
         "ALTER TABLE crawl_results ADD COLUMN IF NOT EXISTS page_depth INTEGER DEFAULT 0",
+        # keywords columns added in v3
+        "ALTER TABLE keywords ADD COLUMN IF NOT EXISTS difficulty INTEGER",
+        "ALTER TABLE keywords ADD COLUMN IF NOT EXISTS language VARCHAR(10) DEFAULT 'en'",
     ]
     for sql in migrations:
         try:
