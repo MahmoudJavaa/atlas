@@ -1,98 +1,158 @@
-"""Google Trends — free relative search interest (0–100) as volume proxy.
+"""Keyword volume estimation — free sources when DataForSEO is not available.
 
-Used as a fallback when DataForSEO is not configured or not yet activated.
-Google Trends returns relative interest (0=lowest, 100=peak), not absolute
-search volume — but it's free, no API key needed, and supports Arabic.
+Priority order tried by get_trends_volume():
+  1. SerpAPI Google Trends  — uses existing SERPAPI_KEY, proxied (no IP blocks)
+  2. pytrends direct        — free but often blocked on cloud server IPs
+  3. Returns empty dict     — difficulty estimates still run regardless
 
-Usage:
-    scores = await get_trends_volume(["real estate egypt", "karnak developments"])
-    # → {"real estate egypt": 72, "karnak developments": 18}
+Volume values are relative interest (0–100), not absolute search counts.
+Display them as-is; once DataForSEO is active, Refresh Volumes upgrades to real numbers.
 """
 from __future__ import annotations
 
 import asyncio
+import httpx
 from typing import Any
 
+from backend.config import settings
 
-async def get_trends_volume(
+
+async def _serpapi_trends(
     keywords: list[str],
-    geo: str = "",        # "" = worldwide, "EG" = Egypt, "SA" = Saudi Arabia
-    timeframe: str = "today 12-m",
-) -> dict[str, int | None]:
-    """Return relative Google Trends interest (0–100) for each keyword.
-
-    Processes in groups of 5 (Google Trends limit per request).
-    Returns empty dict on any failure — never raises.
-    """
-    if not keywords:
+    geo: str = "",
+) -> dict[str, int]:
+    """Fetch Google Trends interest via SerpAPI (proxied — works from cloud servers)."""
+    if not settings.serpapi_key:
         return {}
 
+    scores: dict[str, int] = {}
+    # SerpAPI Trends allows up to 5 comparison keywords per request
+    CHUNK = 5
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        for i in range(0, len(keywords), CHUNK):
+            chunk = keywords[i : i + CHUNK]
+            # Build comma-separated query for multi-keyword comparison
+            q = ",".join(chunk)
+            params = {
+                "engine": "google_trends",
+                "q": q,
+                "data_type": "TIMESERIES",
+                "date": "today 12-m",
+                "api_key": settings.serpapi_key,
+            }
+            if geo:
+                params["geo"] = geo
+
+            try:
+                resp = await client.get("https://serpapi.com/search", params=params)
+                data = resp.json()
+                timeline = data.get("interest_over_time", {}).get("timeline_data", [])
+                if not timeline:
+                    continue
+
+                # Average interest per keyword across all time points
+                sums: dict[str, list[int]] = {kw: [] for kw in chunk}
+                for point in timeline:
+                    for val in point.get("values", []):
+                        kw = val.get("query", "")
+                        v = val.get("extracted_value", 0)
+                        if kw in sums:
+                            sums[kw].append(int(v) if v else 0)
+
+                for kw, vals in sums.items():
+                    if vals:
+                        scores[kw] = round(sum(vals) / len(vals))
+            except Exception:
+                pass
+
+            if i + CHUNK < len(keywords):
+                await asyncio.sleep(0.5)
+
+    return scores
+
+
+async def _pytrends_direct(
+    keywords: list[str],
+    geo: str = "",
+) -> dict[str, int]:
+    """Fetch Google Trends via pytrends (direct — may be blocked on cloud IPs)."""
     try:
         from pytrends.request import TrendReq  # type: ignore
     except ImportError:
         return {}
 
-    scores: dict[str, int | None] = {}
+    scores: dict[str, int] = {}
+    CHUNK = 5
 
-    def _fetch_chunk(chunk: list[str]) -> dict[str, int]:
+    def _fetch(chunk: list[str]) -> dict[str, int]:
         try:
-            pt = TrendReq(hl="en-US", tz=0, timeout=(10, 25), retries=1, backoff_factor=0.5)
-            pt.build_payload(chunk, cat=0, timeframe=timeframe, geo=geo)
+            pt = TrendReq(hl="en-US", tz=0, timeout=(10, 20), retries=1, backoff_factor=0.5)
+            pt.build_payload(chunk, cat=0, timeframe="today 12-m", geo=geo)
             df = pt.interest_over_time()
             if df.empty:
                 return {}
-            result = {}
-            for kw in chunk:
-                if kw in df.columns:
-                    result[kw] = int(df[kw].mean().round())
-            return result
+            return {kw: int(df[kw].mean().round()) for kw in chunk if kw in df.columns}
         except Exception:
             return {}
 
-    # Google Trends allows max 5 keywords per request
-    CHUNK = 5
     for i in range(0, len(keywords), CHUNK):
         chunk = keywords[i : i + CHUNK]
         try:
-            chunk_scores = await asyncio.to_thread(_fetch_chunk, chunk)
-            scores.update(chunk_scores)
+            result = await asyncio.to_thread(_fetch, chunk)
+            scores.update(result)
         except Exception:
             pass
-        # Small delay between requests to avoid rate limiting
         if i + CHUNK < len(keywords):
             await asyncio.sleep(1.5)
 
     return scores
 
 
-async def estimate_difficulty(keyword: str) -> int | None:
-    """Rough keyword difficulty estimate based on word count and common patterns.
+async def get_trends_volume(
+    keywords: list[str],
+    geo: str = "",
+) -> dict[str, int]:
+    """Return relative Google Trends interest (0–100) per keyword.
 
-    Returns 0–100.  Not accurate but better than nothing when no API is available.
-    - Short, generic single words → higher difficulty (more competition)
-    - Long-tail phrases → lower difficulty
-    - Question phrases → lower difficulty (informational, less commercial comp.)
+    Tries SerpAPI first (proxied, reliable), then pytrends direct.
+    Returns empty dict on total failure — never raises.
+    """
+    if not keywords:
+        return {}
+
+    # Try SerpAPI first (proxied residential IPs — won't be blocked)
+    scores = await _serpapi_trends(keywords, geo=geo)
+    if scores:
+        return scores
+
+    # Fallback: direct pytrends (free but cloud IPs often blocked)
+    return await _pytrends_direct(keywords, geo=geo)
+
+
+async def estimate_difficulty(keyword: str) -> int:
+    """Rule-based keyword difficulty estimate (0–100).
+
+    Based on word count and search intent signals.
+    - 1 word  → ~75 (very competitive generic terms)
+    - 2 words → ~55 (medium competition)
+    - 3 words → ~40 (lower competition)
+    - 4+ words → ~25 (long-tail, easiest)
+    Informational signals (-15), commercial signals (+10).
     """
     kw = keyword.lower().strip()
     words = kw.split()
     n = len(words)
 
-    if n == 1:
-        base = 75
-    elif n == 2:
-        base = 55
-    elif n == 3:
-        base = 40
-    else:
-        base = 25  # long-tail → easier
+    base = 75 if n == 1 else 55 if n == 2 else 40 if n == 3 else 25
 
-    # Reduce for question/informational signals
-    info_signals = {"how", "what", "why", "when", "where", "which", "guide", "tutorial", "tips"}
+    info_signals = {"how", "what", "why", "when", "where", "which", "guide", "tutorial", "tips",
+                    "كيف", "ما", "لماذا", "دليل", "شرح"}
     if any(w in info_signals for w in words):
         base -= 15
 
-    # Increase for high-competition commercial signals
-    commercial_signals = {"best", "buy", "price", "cost", "cheap", "top", "review"}
+    commercial_signals = {"best", "buy", "price", "cost", "cheap", "top", "review",
+                          "أفضل", "شراء", "سعر", "تكلفة"}
     if any(w in commercial_signals for w in words):
         base += 10
 
