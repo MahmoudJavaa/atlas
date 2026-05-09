@@ -362,15 +362,17 @@ async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
     updated = 0
     source = "estimated"
 
+    difficulty_set = 0
+    volume_set = 0
+
     # ── Step 1: Rule-based difficulty for every keyword missing it (instant) ──
     for kw in kws:
         if kw.difficulty is None:
             kw.difficulty = await estimate_difficulty(kw.keyword)
-            updated += 1
+            difficulty_set += 1
 
     # ── Step 2: Try DataForSEO for real volume + upgrade difficulty ───────────
     if _is_configured():
-        dfs_updated = 0
         for bucket, lang in [(en_kws, "en"), (ar_kws, "ar")]:
             if not bucket:
                 continue
@@ -380,48 +382,59 @@ async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
                 data = vol_map.get(kw.keyword.lower(), {})
                 if data.get("volume") is not None:
                     kw.volume = data["volume"]
-                    dfs_updated += 1
+                    volume_set += 1
+                # Only upgrade difficulty if DataForSEO returns a valid value
                 if data.get("difficulty") is not None:
                     kw.difficulty = data["difficulty"]
-        if dfs_updated:
+        if volume_set:
             source = "dataforseo"
-            updated = max(updated, dfs_updated)
 
-    # ── Step 3: Try Google Trends for relative volume if still no volume ──────
+    # ── Step 3: Try Google Trends for relative volume if still no real volume ─
     if source != "dataforseo":
         try:
-            en_texts = [k.keyword for k in en_kws if k.volume is None][:30]
-            ar_texts = [k.keyword for k in ar_kws if k.volume is None][:20]
+            # Process up to 100 EN + 50 AR keywords (SerpAPI chunks internally at 5)
+            en_texts = [k.keyword for k in en_kws if k.volume is None][:100]
+            ar_texts = [k.keyword for k in ar_kws if k.volume is None][:50]
             trends_updated = 0
 
             if en_texts:
                 en_scores = await asyncio.wait_for(
-                    get_trends_volume(en_texts, geo=""), timeout=40
+                    get_trends_volume(en_texts, geo=""), timeout=90
                 )
-                en_map = {k.keyword: k for k in en_kws}
+                # Use lowercase map to avoid case-mismatch misses
+                en_map = {k.keyword.lower(): k for k in en_kws}
                 for keyword, score in en_scores.items():
-                    if score and keyword in en_map and en_map[keyword].volume is None:
-                        en_map[keyword].volume = score
+                    kw_obj = en_map.get(keyword.lower())
+                    if score and kw_obj is not None and kw_obj.volume is None:
+                        kw_obj.volume = score
                         trends_updated += 1
 
             if ar_texts:
                 ar_scores = await asyncio.wait_for(
-                    get_trends_volume(ar_texts, geo="SA"), timeout=40
+                    get_trends_volume(ar_texts, geo="SA"), timeout=60
                 )
-                ar_map = {k.keyword: k for k in ar_kws}
+                ar_map = {k.keyword.lower(): k for k in ar_kws}
                 for keyword, score in ar_scores.items():
-                    if score and keyword in ar_map and ar_map[keyword].volume is None:
-                        ar_map[keyword].volume = score
+                    kw_obj = ar_map.get(keyword.lower())
+                    if score and kw_obj is not None and kw_obj.volume is None:
+                        kw_obj.volume = score
                         trends_updated += 1
 
             if trends_updated:
                 source = "google_trends"
-                updated += trends_updated
+                volume_set += trends_updated
         except Exception:
             pass  # Trends blocked — difficulty estimates are already saved
 
+    updated = difficulty_set + volume_set
     await db.flush()
-    return {"updated": updated, "total": len(kws), "source": source}
+    return {
+        "updated": updated,
+        "difficulty_set": difficulty_set,
+        "volume_set": volume_set,
+        "total": len(kws),
+        "source": source,
+    }
 
 
 @router.get("/{site_id}")

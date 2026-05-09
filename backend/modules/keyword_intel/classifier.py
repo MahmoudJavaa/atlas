@@ -120,9 +120,17 @@ class KeywordClassifier:
             for kw in keyword_list:
                 classified_list.append({"keyword": kw, **_rule_based_classify(kw)})
 
-        # Merge volume + difficulty back in
+        # Build a set of classified keywords to catch any that LLM silently dropped
+        classified_kws = {item.get("keyword", "") for item in classified_list}
+        for kw in keyword_list:
+            if kw not in classified_kws:
+                classified_list.append({"keyword": kw, **_rule_based_classify(kw)})
+
+        # Merge volume + difficulty back in (case-insensitive lookup)
+        enriched_map_lower = {k.lower(): v for k, v in enriched_map.items()}
         for item in classified_list:
-            extra = enriched_map.get(item.get("keyword", ""), {})
+            kw_key = item.get("keyword", "").lower()
+            extra = enriched_map_lower.get(kw_key) or enriched_map.get(item.get("keyword", ""), {})
             item.setdefault("volume", extra.get("volume"))
             item.setdefault("difficulty", extra.get("difficulty"))
             item.setdefault("language", extra.get("language", "en"))

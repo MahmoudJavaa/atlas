@@ -143,7 +143,11 @@ export default function KeywordsPage() {
   // ── Mutations ───────────────────────────────────────────────────────────────
   const researchMutation = useMutation({
     mutationFn: () => autoResearchKeywords(siteId!, researchLang),
-    onSuccess:  () => qc.invalidateQueries({ queryKey: ["keywords", siteId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["keywords", siteId] });
+      // Auto-fetch volume + difficulty after research completes
+      setTimeout(() => refreshMutation.mutate(), 800);
+    },
   });
 
   const classifyMutation = useMutation({
@@ -324,14 +328,31 @@ export default function KeywordsPage() {
               </button>
             )}
             {refreshMutation.isSuccess && (
-              <span className="text-green-400 text-xs">
-                ✓ {(refreshMutation.data as any)?.updated ?? 0} keywords enriched
-                {(refreshMutation.data as any)?.source === "google_trends" && (
-                  <span className="text-gray-500 ml-1">(Google Trends estimates)</span>
-                )}
-                {(refreshMutation.data as any)?.source === "dataforseo" && (
-                  <span className="text-gray-500 ml-1">(real data)</span>
-                )}
+              <span className="text-green-400 text-xs flex items-center gap-1.5 flex-wrap">
+                {(() => {
+                  const d = refreshMutation.data as any;
+                  const volSet = d?.volume_set ?? 0;
+                  const diffSet = d?.difficulty_set ?? 0;
+                  const src = d?.source;
+                  return (
+                    <>
+                      ✓
+                      {diffSet > 0 && <span>{diffSet} KD scores</span>}
+                      {volSet > 0 && diffSet > 0 && <span className="text-gray-600">·</span>}
+                      {volSet > 0 && <span>{volSet} volumes</span>}
+                      {volSet === 0 && diffSet === 0 && <span>0 keywords enriched</span>}
+                      {src === "google_trends" && (
+                        <span className="text-gray-500">(Google Trends 0–100 scale)</span>
+                      )}
+                      {src === "dataforseo" && (
+                        <span className="text-gray-500">(real monthly searches)</span>
+                      )}
+                      {src === "estimated" && diffSet > 0 && (
+                        <span className="text-gray-500">(rule-based estimates)</span>
+                      )}
+                    </>
+                  );
+                })()}
               </span>
             )}
             {refreshMutation.isError && (
@@ -649,7 +670,7 @@ export default function KeywordsPage() {
                       <th className="text-left px-4 py-3 font-medium">Intent</th>
                       <th className="text-left px-4 py-3 font-medium">Cluster</th>
                       <th className="text-center px-4 py-3 font-medium">Lang</th>
-                      <th className="text-right px-4 py-3 font-medium">Volume</th>
+                      <th className="text-right px-4 py-3 font-medium" title="Monthly search volume (or Google Trends 0–100 interest if DataForSEO unavailable)">Volume</th>
                       <th className="text-right px-4 py-3 font-medium w-40">Difficulty</th>
                       <th className="text-right px-4 py-3 font-medium">Position</th>
                       <th className="text-right px-4 py-3 font-medium">Clicks</th>

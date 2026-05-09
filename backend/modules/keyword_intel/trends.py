@@ -146,13 +146,25 @@ async def estimate_difficulty(keyword: str) -> int:
 
     base = 75 if n == 1 else 55 if n == 2 else 40 if n == 3 else 25
 
-    info_signals = {"how", "what", "why", "when", "where", "which", "guide", "tutorial", "tips",
-                    "كيف", "ما", "لماذا", "دليل", "شرح"}
+    info_signals = {
+        # English
+        "how", "what", "why", "when", "where", "which", "guide", "tutorial",
+        "tips", "learn", "explained", "examples", "definition", "meaning",
+        # Arabic
+        "كيف", "ما", "لماذا", "متى", "أين", "دليل", "شرح", "نصائح",
+        "تعلم", "مقال", "معنى", "تعريف", "طريقة",
+    }
     if any(w in info_signals for w in words):
         base -= 15
 
-    commercial_signals = {"best", "buy", "price", "cost", "cheap", "top", "review",
-                          "أفضل", "شراء", "سعر", "تكلفة"}
+    commercial_signals = {
+        # English
+        "best", "buy", "price", "cost", "cheap", "top", "review", "reviews",
+        "compare", "vs", "alternative", "affordable", "premium",
+        # Arabic
+        "أفضل", "شراء", "سعر", "تكلفة", "عروض", "خصم", "مراجعة",
+        "مقارنة", "رخيص", "احسن",
+    }
     if any(w in commercial_signals for w in words):
         base += 10
 
