@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   getSites, autoResearchKeywords, classifyKeywords, getKeywords, deleteKeywords, refreshKeywordVolumes,
@@ -40,7 +40,8 @@ function isArabic(text: string) {
 }
 
 function fmtVolume(v: number | null | undefined): string {
-  if (v == null) return "—";
+  // 0 from Google Trends means "no measurable interest" — display as no data
+  if (v == null || v === 0) return "—";
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
   if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
   return v.toLocaleString();
@@ -89,7 +90,8 @@ function exportCsv(keywords: any[]) {
   a.href = url;
   a.download = "keywords.csv";
   a.click();
-  URL.revokeObjectURL(url);
+  // Revoke after a short delay so Firefox/Safari can read the blob before it's freed
+  setTimeout(() => URL.revokeObjectURL(url), 150);
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -141,12 +143,26 @@ export default function KeywordsPage() {
   });
 
   // ── Mutations ───────────────────────────────────────────────────────────────
+  // refreshMutation is defined first so researchMutation can reference it safely
+  const refreshMutation = useMutation({
+    mutationFn: () => refreshKeywordVolumes(siteId!),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["keywords", siteId] }),
+  });
+
+  // Stable ref to refreshMutation.mutate so the timer closure never goes stale
+  const refreshMutateRef = useRef(refreshMutation.mutate);
+  useEffect(() => { refreshMutateRef.current = refreshMutation.mutate; });
+
+  // Ref to cancel any pending auto-refresh timer (prevents stacking on retries)
+  const autoRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const researchMutation = useMutation({
     mutationFn: () => autoResearchKeywords(siteId!, researchLang),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["keywords", siteId] });
-      // Auto-fetch volume + difficulty after research completes
-      setTimeout(() => refreshMutation.mutate(), 800);
+      // Auto-fetch volume + difficulty — cancel any prior pending timer first
+      if (autoRefreshTimer.current) clearTimeout(autoRefreshTimer.current);
+      autoRefreshTimer.current = setTimeout(() => refreshMutateRef.current(), 800);
     },
   });
 
@@ -171,10 +187,12 @@ export default function KeywordsPage() {
     },
   });
 
-  const refreshMutation = useMutation({
-    mutationFn: () => refreshKeywordVolumes(siteId!),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["keywords", siteId] }),
-  });
+  // Auto-dismiss the research success banner after 6 s
+  useEffect(() => {
+    if (!researchMutation.isSuccess) return;
+    const t = setTimeout(() => researchMutation.reset(), 6000);
+    return () => clearTimeout(t);
+  }, [researchMutation.isSuccess]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Derived data ─────────────────────────────────────────────────────────────
   const kws = keywords as any[];
@@ -595,11 +613,13 @@ export default function KeywordsPage() {
                   .sort(([, a], [, b]) => (b as any[]).length - (a as any[]).length)
                   .map(([cluster, items]) => {
                     const arr = items as any[];
-                    const avgVol = arr.filter(k => k.volume != null).length > 0
-                      ? Math.round(arr.filter(k => k.volume != null).reduce((s, k) => s + k.volume, 0) / arr.filter(k => k.volume != null).length)
+                    const withVol  = arr.filter(k => k.volume     != null && k.volume     > 0);
+                    const withKd   = arr.filter(k => k.difficulty != null);
+                    const avgVol   = withVol.length > 0
+                      ? Math.round(withVol.reduce((s, k) => s + k.volume, 0) / withVol.length)
                       : null;
-                    const avgKd = arr.filter(k => k.difficulty != null).length > 0
-                      ? Math.round(arr.filter(k => k.difficulty != null).reduce((s, k) => s + k.difficulty, 0) / arr.filter(k => k.difficulty != null).length)
+                    const avgKd    = withKd.length > 0
+                      ? Math.round(withKd.reduce((s, k) => s + k.difficulty, 0) / withKd.length)
                       : null;
                     return (
                       <div key={cluster} className="card">

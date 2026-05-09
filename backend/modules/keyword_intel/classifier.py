@@ -1,6 +1,7 @@
 """Keyword Intelligence — intent classification + cluster mapping via LLM."""
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,8 +37,8 @@ def _rule_based_classify(keyword: str) -> dict[str, str]:
     kw = keyword.lower()
 
     transactional_signals = [
-        "buy", "order", "price", "cost", "quote", "cheap", "affordable",
-        "near me", "for sale", "hire", "get", "شراء", "سعر", "تكلفة",
+        "buy", "order", "price", "cost", "quote", "cheap",
+        "near me", "for sale", "hire", "شراء", "سعر", "تكلفة",
         "اشتري", "بسعر", "توصيل",
     ]
     commercial_signals = [
@@ -46,8 +47,8 @@ def _rule_based_classify(keyword: str) -> dict[str, str]:
     ]
     informational_signals = [
         "how", "what", "why", "when", "guide", "tutorial", "tips", "learn",
-        "explained", "examples", "كيف", "ما هو", "ما هي", "لماذا", "دليل",
-        "شرح", "تعلم",
+        "explained", "examples", "get started", "كيف", "ما هو", "ما هي",
+        "لماذا", "دليل", "شرح", "تعلم",
     ]
 
     for sig in transactional_signals:
@@ -80,7 +81,7 @@ class KeywordClassifier:
 
         classified = await self._classify_intent(enriched)
         cannibalisation = await self._detect_cannibalization(site_id, classified)
-        await self._save_keywords(site_id, classified)
+        saved_count = await self._save_keywords(site_id, classified)
         cluster_map = self._build_cluster_map(classified)
 
         return {
@@ -88,6 +89,7 @@ class KeywordClassifier:
             "clusters": cluster_map,
             "cannibalization_alerts": cannibalisation,
             "total": len(classified),
+            "saved": saved_count,
         }
 
     async def _classify_intent(self, enriched: list[dict]) -> list[dict]:
@@ -96,6 +98,9 @@ class KeywordClassifier:
         enriched_map = {item["keyword"]: item for item in enriched}
 
         classified_list: list[dict] = []
+
+        # Lowercase input set for fast membership checks
+        input_kws_lower = {kw.lower() for kw in keyword_list}
 
         if llm_is_available():
             # Process in batches of 60 to stay within LLM token limits
@@ -106,9 +111,17 @@ class KeywordClassifier:
                     keywords="\n".join(f"- {kw}" for kw in batch)
                 )
                 try:
-                    batch_result = await self.llm.generate_json_async(prompt)
+                    # 30 s per batch; prevents stalled workers on slow Groq responses
+                    batch_result = await asyncio.wait_for(
+                        self.llm.generate_json_async(prompt), timeout=30
+                    )
                     if isinstance(batch_result, list):
-                        classified_list.extend(batch_result)
+                        # Filter out hallucinated keywords the LLM invented
+                        valid = [
+                            r for r in batch_result
+                            if isinstance(r, dict) and r.get("keyword", "").lower() in input_kws_lower
+                        ]
+                        classified_list.extend(valid)
                     else:
                         raise ValueError("LLM returned non-list")
                 except Exception:
@@ -120,10 +133,10 @@ class KeywordClassifier:
             for kw in keyword_list:
                 classified_list.append({"keyword": kw, **_rule_based_classify(kw)})
 
-        # Build a set of classified keywords to catch any that LLM silently dropped
-        classified_kws = {item.get("keyword", "") for item in classified_list}
+        # Fill in any keywords the LLM silently dropped from its response
+        classified_kws_lower = {item.get("keyword", "").lower() for item in classified_list}
         for kw in keyword_list:
-            if kw not in classified_kws:
+            if kw.lower() not in classified_kws_lower:
                 classified_list.append({"keyword": kw, **_rule_based_classify(kw)})
 
         # Merge volume + difficulty back in (case-insensitive lookup)
@@ -163,14 +176,15 @@ class KeywordClassifier:
             clusters.setdefault(cluster, []).append(item)
         return clusters
 
-    async def _save_keywords(self, site_id: int, classified: list[dict]):
-        """Insert keywords, skipping duplicates that already exist for this site."""
-        # Load existing keywords to avoid duplicates
+    async def _save_keywords(self, site_id: int, classified: list[dict]) -> int:
+        """Insert keywords, skipping duplicates. Returns number of rows actually saved."""
+        # In-memory dedup guard (case-insensitive); DB unique constraint is the safety net
         existing_result = await self.db.execute(
             select(Keyword.keyword).where(Keyword.site_id == site_id)
         )
         existing_set: set[str] = {row[0].lower() for row in existing_result.all()}
 
+        saved = 0
         for item in classified:
             kw_text = (item.get("keyword") or "").strip()
             if not kw_text or kw_text.lower() in existing_set:
@@ -189,7 +203,9 @@ class KeywordClassifier:
                             language=item.get("language", "en"),
                         )
                     )
+                saved += 1
             except Exception:
-                pass  # savepoint — only this row rolls back
+                pass  # DB constraint violation — only this row rolls back
 
         await self.db.flush()
+        return saved

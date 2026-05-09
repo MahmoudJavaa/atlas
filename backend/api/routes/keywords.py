@@ -28,8 +28,10 @@ class ClassifyRequest(BaseModel):
 
 
 class ResearchRequest(BaseModel):
-    language: str = "both"   # "en" | "ar" | "both"
+    language: str = "both"        # "en" | "ar" | "both"
     location_code: Optional[int] = None
+
+    model_config = {"extra": "ignore"}
 
 
 # ── Shared modifier lists ─────────────────────────────────────────────────────
@@ -53,6 +55,7 @@ AR_MODS = [
 ]
 
 EN_STOP = {
+    # True function words / conjunctions / pronouns only
     "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
     "her", "was", "one", "our", "out", "day", "get", "has", "him", "his",
     "how", "man", "new", "now", "old", "see", "two", "way", "who", "boy",
@@ -63,9 +66,8 @@ EN_STOP = {
     "much", "also", "over", "such", "even", "most", "give", "well", "when",
     "here", "then", "both", "does", "come", "could", "other", "were", "those",
     "only", "many", "after", "about", "them", "these", "made", "where",
-    "need", "back", "long", "home", "down", "work", "part", "high", "page",
-    "same", "life", "next", "last", "read", "more", "click", "view", "open",
-    "close", "show", "hide", "type", "size", "copy", "load", "data",
+    # Pure UI noise (not domain keywords)
+    "click", "view", "same", "next", "last", "read", "back", "down",
 }
 
 AR_STOP = {
@@ -201,7 +203,7 @@ async def classify_sync(data: ClassifyRequest, db: AsyncSession = Depends(get_db
 @router.post("/auto-research/{site_id}")
 async def auto_research(
     site_id: int,
-    req: ResearchRequest = ResearchRequest(),
+    req: ResearchRequest = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Auto-research keywords (DataForSEO for real data, templates as fallback)."""
@@ -209,6 +211,9 @@ async def auto_research(
     from backend.models.site import Site
     from backend.modules.keyword_intel.classifier import KeywordClassifier
     from backend.modules.keyword_intel.dataforseo import get_keyword_ideas, _is_configured
+
+    if req is None:
+        req = ResearchRequest()
 
     # ── Site ─────────────────────────────────────────────────────────────────
     site_row = await db.execute(select(Site).where(Site.id == site_id))
@@ -261,11 +266,11 @@ async def auto_research(
 
     do_en = req.language in ("en", "both")
     do_ar = req.language in ("ar", "both")
-    use_dataforseo = _is_configured()
     new_keywords: list[dict] = []
+    dfs_returned_data = False  # True only when DataForSEO returned real keyword ideas
 
     # ── Attempt DataForSEO (real volume + difficulty) ─────────────────────────
-    if use_dataforseo:
+    if _is_configured():
         if do_en and en_seeds:
             en_ideas = await get_keyword_ideas(
                 en_seeds,
@@ -273,7 +278,9 @@ async def auto_research(
                 location_code=req.location_code,
                 limit=700,
             )
-            new_keywords.extend(en_ideas[:700])
+            if en_ideas:
+                new_keywords.extend(en_ideas[:700])
+                dfs_returned_data = True
 
         if do_ar:
             ar_idea_seeds = ar_seeds if ar_seeds else en_seeds[:20]
@@ -283,11 +290,13 @@ async def auto_research(
                 location_code=req.location_code,
                 limit=400,
             )
-            new_keywords.extend(ar_ideas[:400])
+            if ar_ideas:
+                new_keywords.extend(ar_ideas[:400])
+                dfs_returned_data = True
 
     # ── Template fallback (always runs if DataForSEO returned nothing) ────────
     if not new_keywords:
-        use_dataforseo = False
+        dfs_returned_data = False
         if do_en and en_seeds:
             new_keywords.extend(_build_template_keywords(en_seeds, EN_MODS, "en", 700))
         if do_ar and ar_seeds:
@@ -315,8 +324,8 @@ async def auto_research(
     for i in range(0, len(fresh), 60):
         batch = fresh[i : i + 60]
         try:
-            await classifier.run(site_id=site_id, seed_keywords=batch)
-            total_added += len(batch)
+            result = await classifier.run(site_id=site_id, seed_keywords=batch)
+            total_added += result.get("saved", 0)  # actual rows committed, not batch size
         except Exception:
             pass
 
@@ -332,7 +341,7 @@ async def auto_research(
     return {
         "new_keywords_added": total_added,
         "total": len(all_kws),
-        "used_dataforseo": use_dataforseo,
+        "used_dataforseo": dfs_returned_data,
         "keywords": [_kw_dict(k) for k in all_kws],
     }
 
@@ -366,9 +375,10 @@ async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
     volume_set = 0
 
     # ── Step 1: Rule-based difficulty for every keyword missing it (instant) ──
+    # estimate_difficulty is a plain sync function — no await needed
     for kw in kws:
         if kw.difficulty is None:
-            kw.difficulty = await estimate_difficulty(kw.keyword)
+            kw.difficulty = estimate_difficulty(kw.keyword)
             difficulty_set += 1
 
     # ── Step 2: Try DataForSEO for real volume + upgrade difficulty ───────────
@@ -383,42 +393,45 @@ async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
                 if data.get("volume") is not None:
                     kw.volume = data["volume"]
                     volume_set += 1
-                # Only upgrade difficulty if DataForSEO returns a valid value
+                # Only upgrade difficulty when DataForSEO returns a valid value
                 if data.get("difficulty") is not None:
                     kw.difficulty = data["difficulty"]
+                    difficulty_set += 1
         if volume_set:
             source = "dataforseo"
 
-    # ── Step 3: Try Google Trends for relative volume if still no real volume ─
+    # ── Step 3: Google Trends for relative volume — EN + AR in parallel ───────
     if source != "dataforseo":
         try:
-            # Process up to 100 EN + 50 AR keywords (SerpAPI chunks internally at 5)
             en_texts = [k.keyword for k in en_kws if k.volume is None][:100]
             ar_texts = [k.keyword for k in ar_kws if k.volume is None][:50]
+
+            en_map = {k.keyword.lower(): k for k in en_kws}
+            ar_map = {k.keyword.lower(): k for k in ar_kws}
+
+            async def _fetch_en():
+                if not en_texts:
+                    return {}
+                return await asyncio.wait_for(get_trends_volume(en_texts, geo=""), timeout=70)
+
+            async def _fetch_ar():
+                if not ar_texts:
+                    return {}
+                return await asyncio.wait_for(get_trends_volume(ar_texts, geo="SA"), timeout=50)
+
+            en_scores, ar_scores = await asyncio.gather(_fetch_en(), _fetch_ar())
+
             trends_updated = 0
-
-            if en_texts:
-                en_scores = await asyncio.wait_for(
-                    get_trends_volume(en_texts, geo=""), timeout=90
-                )
-                # Use lowercase map to avoid case-mismatch misses
-                en_map = {k.keyword.lower(): k for k in en_kws}
-                for keyword, score in en_scores.items():
-                    kw_obj = en_map.get(keyword.lower())
-                    if score and kw_obj is not None and kw_obj.volume is None:
-                        kw_obj.volume = score
-                        trends_updated += 1
-
-            if ar_texts:
-                ar_scores = await asyncio.wait_for(
-                    get_trends_volume(ar_texts, geo="SA"), timeout=60
-                )
-                ar_map = {k.keyword.lower(): k for k in ar_kws}
-                for keyword, score in ar_scores.items():
-                    kw_obj = ar_map.get(keyword.lower())
-                    if score and kw_obj is not None and kw_obj.volume is None:
-                        kw_obj.volume = score
-                        trends_updated += 1
+            for keyword, score in en_scores.items():
+                kw_obj = en_map.get(keyword.lower())
+                if score and kw_obj is not None and kw_obj.volume is None:
+                    kw_obj.volume = score
+                    trends_updated += 1
+            for keyword, score in ar_scores.items():
+                kw_obj = ar_map.get(keyword.lower())
+                if score and kw_obj is not None and kw_obj.volume is None:
+                    kw_obj.volume = score
+                    trends_updated += 1
 
             if trends_updated:
                 source = "google_trends"

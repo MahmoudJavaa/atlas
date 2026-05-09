@@ -52,17 +52,20 @@ async def _serpapi_trends(
                     continue
 
                 # Average interest per keyword across all time points
-                sums: dict[str, list[int]] = {kw: [] for kw in chunk}
+                # Use lowercase keys to handle SerpAPI case normalisation
+                sums: dict[str, list[int]] = {kw.lower(): [] for kw in chunk}
+                kw_lower_to_orig: dict[str, str] = {kw.lower(): kw for kw in chunk}
                 for point in timeline:
                     for val in point.get("values", []):
-                        kw = val.get("query", "")
+                        kw_key = val.get("query", "").lower()
                         v = val.get("extracted_value", 0)
-                        if kw in sums:
-                            sums[kw].append(int(v) if v else 0)
+                        if kw_key in sums:
+                            sums[kw_key].append(int(v) if v else 0)
 
-                for kw, vals in sums.items():
+                for kw_key, vals in sums.items():
                     if vals:
-                        scores[kw] = round(sum(vals) / len(vals))
+                        orig = kw_lower_to_orig.get(kw_key, kw_key)
+                        scores[orig] = round(sum(vals) / len(vals))
             except Exception:
                 pass
 
@@ -130,7 +133,7 @@ async def get_trends_volume(
     return await _pytrends_direct(keywords, geo=geo)
 
 
-async def estimate_difficulty(keyword: str) -> int:
+def estimate_difficulty(keyword: str) -> int:
     """Rule-based keyword difficulty estimate (0–100).
 
     Based on word count and search intent signals.

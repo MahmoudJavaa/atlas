@@ -52,6 +52,19 @@ async def _migrate_columns(conn):
         # keywords columns added in v3
         "ALTER TABLE keywords ADD COLUMN IF NOT EXISTS difficulty INTEGER",
         "ALTER TABLE keywords ADD COLUMN IF NOT EXISTS language VARCHAR(10) DEFAULT 'en'",
+        # keywords integrity + perf added in v4
+        # Remove exact duplicates first (keep highest-id row per site+keyword)
+        """
+        DELETE FROM keywords a
+        USING keywords b
+        WHERE a.id < b.id
+          AND a.site_id = b.site_id
+          AND a.keyword = b.keyword
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_site_keyword ON keywords(site_id, keyword)",
+        "CREATE INDEX IF NOT EXISTS ix_kw_site_volume   ON keywords(site_id, volume)",
+        "CREATE INDEX IF NOT EXISTS ix_kw_site_intent   ON keywords(site_id, intent)",
+        "CREATE INDEX IF NOT EXISTS ix_kw_site_language ON keywords(site_id, language)",
     ]
     for sql in migrations:
         try:
