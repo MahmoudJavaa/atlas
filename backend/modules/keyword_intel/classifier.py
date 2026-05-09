@@ -16,7 +16,6 @@ INTENT_PROMPT = """You are an SEO keyword intent classifier.
 Given the following keywords, classify each one with:
 1. intent: one of [informational, commercial, transactional, navigational]
 2. cluster: a short topic cluster name (2-5 words, in the same language as the keyword)
-3. funnel_stage: one of [TOFU, MOFU, BOFU]
 
 Rules:
 - informational: how-to, what-is, guides, tutorials, tips
@@ -24,7 +23,7 @@ Rules:
 - transactional: buy, price, cost, order, quote, near me, for sale
 - navigational: brand names, site navigation keywords
 
-Return a JSON array. Each item must have: keyword, intent, cluster, funnel_stage.
+Return a JSON array. Each item must have exactly: keyword, intent, cluster.
 Only return valid JSON — no markdown, no explanation.
 
 Keywords:
@@ -152,8 +151,15 @@ class KeywordClassifier:
         return classified_list
 
     async def _detect_cannibalization(self, site_id: int, classified: list[dict]) -> list[dict]:
-        """Detect multiple keywords targeting the same URL."""
-        alerts = []
+        """Detect multiple keywords targeting the same URL (requires GSC data)."""
+        # URLs are only populated by the GSC sync module — skip the DB round-trip
+        # when no keywords have URLs yet (the common case during auto-research).
+        count_row = await self.db.execute(
+            select(Keyword.id).where(Keyword.site_id == site_id, Keyword.url.isnot(None)).limit(1)
+        )
+        if count_row.first() is None:
+            return []  # no URL data yet — cannibalization check is a post-GSC feature
+
         existing_stmt = select(Keyword).where(Keyword.site_id == site_id, Keyword.url.isnot(None))
         result = await self.db.execute(existing_stmt)
         existing = result.scalars().all()
@@ -163,11 +169,11 @@ class KeywordClassifier:
             if kw.url:
                 url_keyword_map.setdefault(kw.url, []).append(kw.keyword)
 
-        for url, kws in url_keyword_map.items():
-            if len(kws) > 1:
-                alerts.append({"url": url, "competing_keywords": kws})
-
-        return alerts
+        return [
+            {"url": url, "competing_keywords": kws}
+            for url, kws in url_keyword_map.items()
+            if len(kws) > 1
+        ]
 
     def _build_cluster_map(self, classified: list[dict]) -> dict[str, list[dict]]:
         clusters: dict[str, list[dict]] = {}
@@ -177,35 +183,41 @@ class KeywordClassifier:
         return clusters
 
     async def _save_keywords(self, site_id: int, classified: list[dict]) -> int:
-        """Insert keywords, skipping duplicates. Returns number of rows actually saved."""
-        # In-memory dedup guard (case-insensitive); DB unique constraint is the safety net
-        existing_result = await self.db.execute(
-            select(Keyword.keyword).where(Keyword.site_id == site_id)
-        )
-        existing_set: set[str] = {row[0].lower() for row in existing_result.all()}
+        """Bulk-insert keywords, skipping duplicates via ON CONFLICT DO NOTHING.
 
-        saved = 0
+        Uses a single INSERT statement so there are no per-row savepoints.
+        The DB unique constraint on (site_id, keyword) is the authoritative guard.
+        Returns the number of rows actually inserted.
+        """
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        # In-memory dedup (case-insensitive) to collapse duplicates within this batch
+        # before hitting the DB (avoids unnecessary conflict rows).
+        seen: set[str] = set()
+        rows: list[dict] = []
         for item in classified:
             kw_text = (item.get("keyword") or "").strip()
-            if not kw_text or kw_text.lower() in existing_set:
+            if not kw_text or kw_text.lower() in seen:
                 continue
-            existing_set.add(kw_text.lower())
-            try:
-                async with self.db.begin_nested():
-                    self.db.add(
-                        Keyword(
-                            site_id=site_id,
-                            keyword=kw_text,
-                            intent=item.get("intent"),
-                            cluster=item.get("cluster"),
-                            volume=item.get("volume"),
-                            difficulty=item.get("difficulty"),
-                            language=item.get("language", "en"),
-                        )
-                    )
-                saved += 1
-            except Exception:
-                pass  # DB constraint violation — only this row rolls back
+            seen.add(kw_text.lower())
+            rows.append({
+                "site_id":   site_id,
+                "keyword":   kw_text,
+                "intent":    item.get("intent"),
+                "cluster":   item.get("cluster"),
+                "volume":    item.get("volume"),
+                "difficulty": item.get("difficulty"),
+                "language":  item.get("language", "en"),
+            })
 
+        if not rows:
+            return 0
+
+        stmt = (
+            pg_insert(Keyword)
+            .values(rows)
+            .on_conflict_do_nothing(constraint="uq_site_keyword")
+        )
+        result = await self.db.execute(stmt)
         await self.db.flush()
-        return saved
+        return result.rowcount or 0

@@ -188,11 +188,18 @@ export default function KeywordsPage() {
   });
 
   // Auto-dismiss the research success banner after 6 s
+  const researchResetRef = useRef(researchMutation.reset);
+  useEffect(() => { researchResetRef.current = researchMutation.reset; });
   useEffect(() => {
     if (!researchMutation.isSuccess) return;
-    const t = setTimeout(() => researchMutation.reset(), 6000);
+    const t = setTimeout(() => researchResetRef.current(), 6000);
     return () => clearTimeout(t);
-  }, [researchMutation.isSuccess]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [researchMutation.isSuccess]);
+
+  // Clean up auto-refresh timer on unmount to prevent orphaned network requests
+  useEffect(() => () => {
+    if (autoRefreshTimer.current) clearTimeout(autoRefreshTimer.current);
+  }, []);
 
   // ── Derived data ─────────────────────────────────────────────────────────────
   const kws = keywords as any[];
@@ -570,7 +577,11 @@ export default function KeywordsPage() {
                 </button>
               )}
 
-              <span className="text-gray-500 text-sm">{filtered.length.toLocaleString()} shown</span>
+              <span className="text-gray-500 text-sm">
+                {view === "table" && filtered.length > 500
+                  ? `500 of ${filtered.length.toLocaleString()} shown`
+                  : `${filtered.length.toLocaleString()} shown`}
+              </span>
             </div>
           )}
 

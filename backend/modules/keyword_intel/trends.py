@@ -29,7 +29,7 @@ async def _serpapi_trends(
     # SerpAPI Trends allows up to 5 comparison keywords per request
     CHUNK = 5
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=12) as client:
         for i in range(0, len(keywords), CHUNK):
             chunk = keywords[i : i + CHUNK]
             # Build comma-separated query for multi-keyword comparison

@@ -1,4 +1,4 @@
-from sqlalchemy import String, Integer, Float, DateTime, ForeignKey, Date, func, UniqueConstraint, Index
+from sqlalchemy import String, Integer, Float, DateTime, ForeignKey, Date, func, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from datetime import datetime, date
 from backend.database import Base
@@ -7,9 +7,8 @@ from backend.database import Base
 class Keyword(Base):
     __tablename__ = "keywords"
     __table_args__ = (
-        # Prevent duplicate (site, keyword) pairs — main correctness guarantee
-        UniqueConstraint("site_id", "keyword", name="uq_site_keyword"),
         # Composite indexes for the common filter+sort patterns in GET /{site_id}
+        # Unique constraint + dedup migration are handled in database._migrate_columns
         Index("ix_kw_site_volume",   "site_id", "volume"),
         Index("ix_kw_site_intent",   "site_id", "intent"),
         Index("ix_kw_site_language", "site_id", "language"),

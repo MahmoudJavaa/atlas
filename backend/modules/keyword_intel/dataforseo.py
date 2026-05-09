@@ -68,47 +68,51 @@ async def get_keyword_ideas(
     loc = location_code or _LOCATION.get(language_code, 2840)
     results: list[dict] = []
 
+    # Semaphore: cap concurrent DFS requests to avoid rate-limit errors
+    sem = asyncio.Semaphore(5)
+
     async def _fetch_chunk(client: httpx.AsyncClient, chunk: list[str]) -> list[dict]:
-        payload = [
-            {
-                "keywords": chunk,
-                "language_code": language_code,
-                "location_code": loc,
-                "limit": limit,
-                "include_seed_keyword": True,
-            }
-        ]
-        try:
-            resp = await client.post(
-                f"{_BASE}/keywords_data/google_ads/keywords_for_keywords/live",
-                json=payload,
-                headers=_auth(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            chunk_results: list[dict] = []
-            for task in data.get("tasks", []):
-                # 40104 = account not verified / insufficient funds (HTTP 200 body error)
-                if task.get("status_code") == 40104:
-                    log.warning("DataForSEO 40104: account not verified or insufficient funds")
-                    return []
-                for res in task.get("result") or []:
-                    for item in res.get("items") or []:
-                        kw = (item.get("keyword") or "").strip()
-                        if not kw:
-                            continue
-                        chunk_results.append(
-                            {
-                                "keyword": kw,
-                                "volume": item.get("search_volume"),
-                                "difficulty": item.get("competition_index"),
-                                "cpc": item.get("cpc"),
-                                "language": language_code,
-                            }
-                        )
-            return chunk_results
-        except Exception:
-            return []  # don't abort entire research on one chunk failure
+        async with sem:
+            payload = [
+                {
+                    "keywords": chunk,
+                    "language_code": language_code,
+                    "location_code": loc,
+                    "limit": limit,
+                    "include_seed_keyword": True,
+                }
+            ]
+            try:
+                resp = await client.post(
+                    f"{_BASE}/keywords_data/google_ads/keywords_for_keywords/live",
+                    json=payload,
+                    headers=_auth(),
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                chunk_results: list[dict] = []
+                for task in data.get("tasks", []):
+                    # 40104 = account not verified / insufficient funds (HTTP 200 body error)
+                    if task.get("status_code") == 40104:
+                        log.warning("DataForSEO 40104: account not verified or insufficient funds")
+                        return []
+                    for res in task.get("result") or []:
+                        for item in res.get("items") or []:
+                            kw = (item.get("keyword") or "").strip()
+                            if not kw:
+                                continue
+                            chunk_results.append(
+                                {
+                                    "keyword": kw,
+                                    "volume": item.get("search_volume"),
+                                    "difficulty": item.get("competition_index"),
+                                    "cpc": item.get("cpc"),
+                                    "language": language_code,
+                                }
+                            )
+                return chunk_results
+            except Exception:
+                return []  # don't abort entire research on one chunk failure
 
     # DataForSEO accepts up to 20 seed keywords per request — run chunks in parallel
     chunks = [seed_keywords[i : i + 20] for i in range(0, len(seed_keywords), 20)]
@@ -143,34 +147,40 @@ async def get_search_volume(
     loc = location_code or _LOCATION.get(language_code, 2840)
     volume_map: dict[str, dict] = {}
 
-    async def _fetch_volume_chunk(client: httpx.AsyncClient, chunk: list[str]) -> dict[str, dict]:
-        payload = [{"keywords": chunk, "language_code": language_code, "location_code": loc}]
-        try:
-            resp = await client.post(
-                f"{_BASE}/keywords_data/google_ads/search_volume/live",
-                json=payload,
-                headers=_auth(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result: dict[str, dict] = {}
-            for task in data.get("tasks", []):
-                if task.get("status_code") == 40104:
-                    log.warning("DataForSEO 40104: account not verified or insufficient funds")
-                    return {}
-                for res in task.get("result") or []:
-                    kw = (res.get("keyword") or "").strip().lower()
-                    if kw:
-                        result[kw] = {
-                            "volume": res.get("search_volume"),
-                            "difficulty": res.get("competition_index"),
-                            "cpc": res.get("cpc"),
-                        }
-            return result
-        except Exception:
-            return {}
+    # Semaphore: cap concurrent DFS requests to avoid rate-limit errors
+    sem = asyncio.Semaphore(5)
 
-    chunks = [keywords[i : i + 700] for i in range(0, len(keywords), 700)]
+    async def _fetch_volume_chunk(client: httpx.AsyncClient, chunk: list[str]) -> dict[str, dict]:
+        async with sem:
+            payload = [{"keywords": chunk, "language_code": language_code, "location_code": loc}]
+            try:
+                resp = await client.post(
+                    f"{_BASE}/keywords_data/google_ads/search_volume/live",
+                    json=payload,
+                    headers=_auth(),
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                result: dict[str, dict] = {}
+                for task in data.get("tasks", []):
+                    if task.get("status_code") == 40104:
+                        log.warning("DataForSEO 40104: account not verified or insufficient funds")
+                        return {}
+                    for res in task.get("result") or []:
+                        kw = (res.get("keyword") or "").strip().lower()
+                        if kw:
+                            result[kw] = {
+                                "volume": res.get("search_volume"),
+                                "difficulty": res.get("competition_index"),
+                                "cpc": res.get("cpc"),
+                            }
+                return result
+            except Exception:
+                return {}
+
+    # DFS search_volume accepts up to 1000/request but practical payload limit
+    # is ~100-200; keep chunks at 100 to stay safely within limits.
+    chunks = [keywords[i : i + 100] for i in range(0, len(keywords), 100)]
     async with httpx.AsyncClient(timeout=30) as client:
         chunk_maps = await asyncio.gather(*[_fetch_volume_chunk(client, c) for c in chunks])
     for cm in chunk_maps:

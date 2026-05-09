@@ -98,7 +98,8 @@ def _is_clean_seed(phrase: str) -> bool:
 
 
 def _phrases_from_text(text: str, stop: set) -> list[str]:
-    words = [w for w in text.split() if len(w) > 3 and w not in stop]
+    # >= 3 keeps short but meaningful words: "seo", "app", Arabic 3-char words like "مصر"
+    words = [w for w in text.split() if len(w) >= 3 and w not in stop]
     out: list[str] = []
     for i, w in enumerate(words):
         out.append(w)
@@ -169,6 +170,7 @@ async def classify_sync(data: ClassifyRequest, db: AsyncSession = Depends(get_db
     """Classify custom seed keywords, enrich with real volume data, and save."""
     from backend.modules.keyword_intel.classifier import KeywordClassifier
     from backend.modules.keyword_intel.dataforseo import get_search_volume
+    from backend.modules.keyword_intel.trends import estimate_difficulty
 
     def _detect_lang(kw: str) -> str:
         return "ar" if re.search(r"[؀-ۿ]", kw) else "en"
@@ -195,6 +197,11 @@ async def classify_sync(data: ClassifyRequest, db: AsyncSession = Depends(get_db
     if not enriched:
         enriched = [{"keyword": k, "volume": None, "difficulty": None, "language": "en"}
                     for k in data.seed_keywords]
+
+    # Fill in rule-based difficulty for any keyword DataForSEO didn't enrich (BUG-17)
+    for item in enriched:
+        if item.get("difficulty") is None:
+            item["difficulty"] = estimate_difficulty(item["keyword"])
 
     classifier = KeywordClassifier(db=db)
     return await classifier.run(site_id=data.site_id, seed_keywords=enriched)
@@ -321,13 +328,16 @@ async def auto_research(
     # ── Classify intent + save in batches ─────────────────────────────────────
     classifier = KeywordClassifier(db=db)
     total_added = 0
+    batch_errors = 0
     for i in range(0, len(fresh), 60):
         batch = fresh[i : i + 60]
         try:
             result = await classifier.run(site_id=site_id, seed_keywords=batch)
             total_added += result.get("saved", 0)  # actual rows committed, not batch size
-        except Exception:
-            pass
+        except Exception as exc:
+            batch_errors += 1
+            import logging
+            logging.getLogger(__name__).warning("Keyword batch %d failed: %s", i // 60, exc)
 
     # ── Return all keywords for this site ─────────────────────────────────────
     all_kws_row = await db.execute(
@@ -342,7 +352,8 @@ async def auto_research(
         "new_keywords_added": total_added,
         "total": len(all_kws),
         "used_dataforseo": dfs_returned_data,
-        "keywords": [_kw_dict(k) for k in all_kws],
+        # Omit full keywords array — frontend re-fetches via invalidateQueries
+        # (avoids serialising up to 2000 rows on every research run)
     }
 
 
@@ -393,21 +404,24 @@ async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
                 if data.get("volume") is not None:
                     kw.volume = data["volume"]
                     volume_set += 1
-                # Only upgrade difficulty when DataForSEO returns a valid value
+                # Upgrade difficulty silently — don't double-count; Step 1 already
+                # populated difficulty_set for keywords that were missing it.
                 if data.get("difficulty") is not None:
                     kw.difficulty = data["difficulty"]
-                    difficulty_set += 1
         if volume_set:
             source = "dataforseo"
 
     # ── Step 3: Google Trends for relative volume — EN + AR in parallel ───────
+    # Cap at 50 EN / 25 AR: each SerpAPI call ~3 s avg + 0.5 s sleep.
+    # 10 EN chunks × 3.5 s = 35 s, well inside the 70 s outer budget.
     if source != "dataforseo":
         try:
-            en_texts = [k.keyword for k in en_kws if k.volume is None][:100]
-            ar_texts = [k.keyword for k in ar_kws if k.volume is None][:50]
+            en_texts = [k.keyword for k in en_kws if k.volume is None][:50]
+            ar_texts = [k.keyword for k in ar_kws if k.volume is None][:25]
 
-            en_map = {k.keyword.lower(): k for k in en_kws}
-            ar_map = {k.keyword.lower(): k for k in ar_kws}
+            # Keyed by original case so Trends lookup and DB update use the same object
+            en_map = {k.keyword: k for k in en_kws}
+            ar_map = {k.keyword: k for k in ar_kws}
 
             async def _fetch_en():
                 if not en_texts:
@@ -423,12 +437,13 @@ async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
 
             trends_updated = 0
             for keyword, score in en_scores.items():
-                kw_obj = en_map.get(keyword.lower())
+                # Try exact match first, then case-insensitive fallback
+                kw_obj = en_map.get(keyword) or en_map.get(keyword.lower())
                 if score and kw_obj is not None and kw_obj.volume is None:
                     kw_obj.volume = score
                     trends_updated += 1
             for keyword, score in ar_scores.items():
-                kw_obj = ar_map.get(keyword.lower())
+                kw_obj = ar_map.get(keyword) or ar_map.get(keyword.lower())
                 if score and kw_obj is not None and kw_obj.volume is None:
                     kw_obj.volume = score
                     trends_updated += 1
@@ -437,10 +452,10 @@ async def refresh_volumes(site_id: int, db: AsyncSession = Depends(get_db)):
                 source = "google_trends"
                 volume_set += trends_updated
         except Exception:
-            pass  # Trends blocked — difficulty estimates are already saved
+            pass  # Trends blocked — difficulty estimates are already committed
 
     updated = difficulty_set + volume_set
-    await db.flush()
+    # No explicit flush needed — get_db dependency commits on clean return
     return {
         "updated": updated,
         "difficulty_set": difficulty_set,
@@ -475,5 +490,5 @@ async def get_keywords(
 async def delete_keywords(site_id: int, db: AsyncSession = Depends(get_db)):
     """Delete all keywords for this site to allow a fresh research run."""
     result = await db.execute(sql_delete(Keyword).where(Keyword.site_id == site_id))
-    await db.flush()
+    # get_db commits on clean return — no explicit flush needed
     return {"deleted": result.rowcount}
